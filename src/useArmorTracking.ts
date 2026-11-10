@@ -3,8 +3,11 @@ import type { CameraStatus, Landmark, TrackingFrame, TrackingWorkerResponse } fr
 
 export type { CameraStatus, Landmark, TrackingFrame } from './trackingTypes';
 
-const TRACKING_INPUT_MAX_SIZE = 384;
-const TRACKING_MAX_FPS = 12;
+// Keep pose inference responsive enough for smooth suit placement while bounding
+// the amount of work sent to slower CPUs. Three.js interpolates between results.
+const TRACKING_INPUT_MAX_SIZE = 512;
+const GPU_TRACKING_MAX_FPS = 18;
+const CPU_TRACKING_MAX_FPS = 12;
 
 const EMPTY_FRAME: TrackingFrame = {
   pose: [],
@@ -23,6 +26,7 @@ export function useArmorTracking() {
   const frameRequestRef = useRef<number | null>(null);
   const lastVideoTimeRef = useRef(-1);
   const lastFrameSubmittedAtRef = useRef(0);
+  const trackingMaxFpsRef = useRef(GPU_TRACKING_MAX_FPS);
   const fpsRef = useRef({ frames: 0, startedAt: performance.now(), value: 0 });
   const lastPublishedFrameRef = useRef(0);
   const latestFrameRef = useRef(EMPTY_FRAME);
@@ -48,6 +52,7 @@ export function useArmorTracking() {
 
     lastVideoTimeRef.current = -1;
     lastFrameSubmittedAtRef.current = 0;
+    trackingMaxFpsRef.current = GPU_TRACKING_MAX_FPS;
     fpsRef.current = { frames: 0, startedAt: performance.now(), value: 0 };
     lastPublishedFrameRef.current = 0;
     latestFrameRef.current = EMPTY_FRAME;
@@ -118,6 +123,7 @@ export function useArmorTracking() {
         if (data.type === 'ready') {
           initialized = true;
           workerReadyRef.current = true;
+          trackingMaxFpsRef.current = data.delegate === 'CPU' ? CPU_TRACKING_MAX_FPS : GPU_TRACKING_MAX_FPS;
           setCpuMode(data.delegate === 'CPU');
           resolveInitialization?.();
           resolveInitialization = null;
@@ -154,6 +160,8 @@ export function useArmorTracking() {
         };
         latestFrameRef.current = nextFrame;
 
+        // Keep React/UI updates lightweight; the WebGL loop consumes every result
+        // directly through latestFrameRef and interpolates it between renders.
         if (data.timestamp - lastPublishedFrameRef.current >= 100 || lastPublishedFrameRef.current === 0) {
           lastPublishedFrameRef.current = data.timestamp;
           setFrame(nextFrame);
@@ -187,7 +195,7 @@ export function useArmorTracking() {
           !workerBusyRef.current &&
           activeVideo.readyState >= 2 &&
           activeVideo.currentTime !== lastVideoTimeRef.current &&
-          timestamp - lastFrameSubmittedAtRef.current >= 1000 / TRACKING_MAX_FPS
+          timestamp - lastFrameSubmittedAtRef.current >= 1000 / trackingMaxFpsRef.current
         ) {
           lastVideoTimeRef.current = activeVideo.currentTime;
           lastFrameSubmittedAtRef.current = timestamp;
