@@ -1,1072 +1,1520 @@
 import * as THREE from 'three';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
-import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import type { Landmark } from './trackingTypes';
+import {
+  buildArcReactor,
+  buildBoot,
+  buildForearm,
+  buildHand,
+  buildHelmet,
+  buildJoint,
+  buildNeck,
+  buildPauldron,
+  buildPelvis,
+  buildShin,
+  buildThigh,
+  buildTorso,
+  buildUpperArm,
+  createFingerGeo,
+  type ArcReactorRig,
+  type HandRig,
+  type HelmetRig,
+} from './armorGeometry';
+import { createStudioArmorEnvironment, WebcamLightProbe } from './armorTextures';
+import { createMark85Materials, type Mark85Materials } from './nanotechShader';
+import { soundFx } from './soundEffects';
+import type { Landmark, SuitPhase, SuitTelemetry, TrackingFrame } from './trackingTypes';
 
-export type OverlayOptions = {
-  armor: boolean;
-  face: boolean;
-  body: boolean;
-  hands: boolean;
-  effects: boolean;
-  intensity: number;
+const FINGER_CHAINS: [number, number][][] = [
+  [[1, 2], [2, 3], [3, 4]],
+  [[5, 6], [6, 7], [7, 8]],
+  [[9, 10], [10, 11], [11, 12]],
+  [[13, 14], [14, 15], [15, 16]],
+  [[17, 18], [18, 19], [19, 20]],
+];
+
+const SUIT_MIN_PROGRESS = -0.46;
+const SUIT_MAX_PROGRESS = 4.55;
+const SUIT_UP_SPEED = 1.48; // ~3.3s cinematic full-body liquid-metal materialization from chest
+const SUIT_DOWN_SPEED = 1.85;
+const CHEST_HOLD_SEC = 0.62;
+const CHEST_COOLDOWN_MS = 1500;
+const VISOR_OPEN = -0.36;
+const VISOR_CLOSED = 1.85;
+const BODY_GRACE_MS = 450;
+
+type CoverTransform = { scale: number; offsetX: number; offsetY: number };
+
+type ScreenPt = { x: number; y: number; z: number; vis: number };
+
+/** Adaptive One-Euro low-pass filter: rock-steady when still, zero lag during fast body movement. */
+class OneEuroScalar {
+  private x = 0;
+  private dx = 0;
+  private ready = false;
+
+  constructor(
+    private readonly minCutoff = 1.65,
+    private readonly beta = 0.042,
+    private readonly dCutoff = 1.0,
+  ) {}
+
+  private alpha(cutoff: number, dt: number): number {
+    const tau = 1 / (2 * Math.PI * cutoff);
+    return 1 / (1 + tau / Math.max(dt, 1 / 240));
+  }
+
+  filter(value: number, dt: number): number {
+    if (!this.ready || !Number.isFinite(this.x)) {
+      this.x = value;
+      this.dx = 0;
+      this.ready = true;
+      return value;
+    }
+    const rawDx = (value - this.x) / Math.max(dt, 1 / 120);
+    const ad = this.alpha(this.dCutoff, dt);
+    this.dx = this.dx + ad * (rawDx - this.dx);
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
+    const a = this.alpha(cutoff, dt);
+    this.x = this.x + a * (value - this.x);
+    return this.x;
+  }
+
+  reset() {
+    this.ready = false;
+  }
+}
+
+class PointFilterBank {
+  private bank = new Map<number, [OneEuroScalar, OneEuroScalar, OneEuroScalar]>();
+
+  constructor(
+    private readonly minCutoff: number,
+    private readonly beta: number,
+  ) {}
+
+  update(raw: Landmark[], dt: number): Landmark[] {
+    if (raw.length === 0) return [];
+    const out: Landmark[] = new Array(raw.length);
+    for (let i = 0; i < raw.length; i++) {
+      const p = raw[i];
+      let f = this.bank.get(i);
+      if (!f) {
+        f = [
+          new OneEuroScalar(this.minCutoff, this.beta),
+          new OneEuroScalar(this.minCutoff, this.beta),
+          new OneEuroScalar(this.minCutoff * 0.85, this.beta * 0.7),
+        ];
+        this.bank.set(i, f);
+      }
+      out[i] = {
+        x: f[0].filter(p.x, dt),
+        y: f[1].filter(p.y, dt),
+        z: f[2].filter(p.z ?? 0, dt),
+        visibility: p.visibility,
+      };
+    }
+    return out;
+  }
+
+  reset() {
+    this.bank.clear();
+  }
+}
+
+type FullBodyRig = {
+  root: THREE.Group;
+  reactor: ArcReactorRig;
+  torso: THREE.Group;
+  pelvis: THREE.Group;
+  neck: THREE.Group;
+  helmet: HelmetRig;
+  pauldronL: THREE.Group;
+  pauldronR: THREE.Group;
+  upperArmL: THREE.Group;
+  upperArmR: THREE.Group;
+  elbowL: THREE.Group;
+  elbowR: THREE.Group;
+  forearmL: THREE.Group;
+  forearmR: THREE.Group;
+  hipL: THREE.Group;
+  hipR: THREE.Group;
+  thighL: THREE.Group;
+  thighR: THREE.Group;
+  kneeL: THREE.Group;
+  kneeR: THREE.Group;
+  shinL: THREE.Group;
+  shinR: THREE.Group;
+  bootL: THREE.Group;
+  bootR: THREE.Group;
+  hands: [HandRig, HandRig];
+  fingerGeo: THREE.BufferGeometry;
 };
 
-const armorShell = new THREE.MeshStandardMaterial({
-  color: 0xb8343b,
-  metalness: 0.95,
-  roughness: 0.15,
-  emissive: 0x300609,
-  emissiveIntensity: 0.5,
-  transparent: true,
-  opacity: 0.94,
-  depthTest: false,
-  side: THREE.DoubleSide,
-});
-const armorGold = new THREE.MeshStandardMaterial({
-  color: 0xe1b957,
-  metalness: 0.92,
-  roughness: 0.16,
-  emissive: 0x352005,
-  emissiveIntensity: 0.5,
-  transparent: true,
-  opacity: 0.95,
-  depthTest: false,
-  side: THREE.DoubleSide,
-});
-const armorSteel = new THREE.MeshStandardMaterial({
-  color: 0x8496a3,
-  metalness: 0.9,
-  roughness: 0.18,
-  emissive: 0x14202a,
-  emissiveIntensity: 0.45,
-  transparent: true,
-  opacity: 0.86,
-  depthTest: false,
-  side: THREE.DoubleSide,
-});
-const armorAccent = new THREE.MeshBasicMaterial({
-  color: 0x8beeff,
-  transparent: true,
-  opacity: 0.92,
-  depthTest: false,
-  side: THREE.DoubleSide,
-});
-const energyMaterial = new THREE.MeshBasicMaterial({
-  color: 0x80eaff,
-  transparent: true,
-  opacity: 0.94,
-  depthTest: false,
-});
-const lineMaterial = new THREE.LineBasicMaterial({
-  color: 0x73ddff,
-  transparent: true,
-  opacity: 0.83,
-  depthTest: false,
-});
+type PostPipeline = {
+  sceneRT: THREE.WebGLRenderTarget;
+  brightRT: THREE.WebGLRenderTarget;
+  blurART: THREE.WebGLRenderTarget;
+  blurBRT: THREE.WebGLRenderTarget;
+  postCam: THREE.OrthographicCamera;
+  postScene: THREE.Scene;
+  quad: THREE.Mesh;
+  brightMat: THREE.ShaderMaterial;
+  blurMat: THREE.ShaderMaterial;
+  compositeMat: THREE.ShaderMaterial;
+  dispose: () => void;
+};
 
-const pulsingMaterials: THREE.MeshStandardMaterial[] = [];
-
-function addPulsingEmission(material: THREE.MeshStandardMaterial) {
-  material.onBeforeCompile = (shader) => {
-    shader.uniforms.uArmorTime = { value: 0 };
-    shader.fragmentShader = shader.fragmentShader.replace(
-      '#include <common>',
-      '#include <common>\nuniform float uArmorTime;',
+function createPostPipeline(renderer: THREE.WebGLRenderer, w: number, h: number): PostPipeline {
+  const supportsFloatRT =
+    renderer.capabilities.isWebGL2 &&
+    Boolean(
+      renderer.extensions.has('EXT_color_buffer_float') ||
+        renderer.extensions.has('EXT_color_buffer_half_float'),
     );
-    shader.fragmentShader = shader.fragmentShader.replace(
-      '#include <emissivemap_fragment>',
-      '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vec3(0.008, 0.055, 0.075) * (0.55 + 0.45 * sin(uArmorTime * 2.1));',
-    );
-    material.userData.pulseShader = shader;
+  const rtOpts: THREE.RenderTargetOptions = {
+    type: supportsFloatRT ? THREE.HalfFloatType : THREE.UnsignedByteType,
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    depthBuffer: true,
+    stencilBuffer: false,
   };
-  material.customProgramCacheKey = () => 'armor-pulse-emission-v1';
-  pulsingMaterials.push(material);
-}
+  const bw = Math.max(2, w >> 1);
+  const bh = Math.max(2, h >> 1);
 
-addPulsingEmission(armorShell);
-addPulsingEmission(armorGold);
-addPulsingEmission(armorSteel);
+  const sceneRT = new THREE.WebGLRenderTarget(w, h, rtOpts);
+  const brightRT = new THREE.WebGLRenderTarget(bw, bh, { ...rtOpts, depthBuffer: false });
+  const blurART = new THREE.WebGLRenderTarget(bw, bh, { ...rtOpts, depthBuffer: false });
+  const blurBRT = new THREE.WebGLRenderTarget(bw, bh, { ...rtOpts, depthBuffer: false });
 
-function makeShape(points: [number, number][]) {
-  const shape = new THREE.Shape();
-  shape.moveTo(points[0][0], points[0][1]);
-  points.slice(1).forEach(([x, y]) => shape.lineTo(x, y));
-  shape.closePath();
-  return new THREE.ExtrudeGeometry(shape, {
-    bevelEnabled: true,
-    bevelSegments: 2,
-    bevelSize: 0.035,
-    bevelThickness: 0.025,
-    depth: 0.055,
-    steps: 1,
+  const vs = /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = vec4(position.xy, 0.0, 1.0);
+    }
+  `;
+
+  // Selective HDR bloom: ONLY genuine emissives (Arc Reactor, eyes, RT slits, repulsors, nanite seam) bloom!
+  const brightMat = new THREE.ShaderMaterial({
+    uniforms: {
+      tInput: { value: sceneRT.texture },
+      uThreshold: { value: 1.08 },
+    },
+    vertexShader: vs,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D tInput;
+      uniform float uThreshold;
+      varying vec2 vUv;
+      void main() {
+        vec4 c = texture2D(tInput, vUv);
+        vec3 rgb = c.rgb;
+        float br = max(max(rgb.r, rgb.g), rgb.b);
+        float knee = 0.42;
+        float soft = clamp(br - uThreshold + knee, 0.0, 2.0 * knee);
+        soft = (soft * soft) / (4.0 * knee + 1e-4);
+        float contrib = max(soft, br - uThreshold) / max(br, 1e-4);
+        gl_FragColor = vec4(rgb * max(contrib, 0.0), 1.0);
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
   });
-}
 
-function addPlate(
-  parent: THREE.Object3D,
-  points: [number, number][],
-  material: THREE.Material,
-  z: number,
-) {
-  const mesh = new THREE.Mesh(makeShape(points), material);
-  mesh.position.z = z;
-  parent.add(mesh);
-  return mesh;
-}
-
-function addArmorJoint(parent: THREE.Object3D) {
-  const joint = new THREE.Group();
-  const shell = new THREE.Mesh(new THREE.SphereGeometry(0.5, 20, 14), armorSteel);
-  const cap = new THREE.Mesh(new THREE.SphereGeometry(0.38, 18, 12), armorShell);
-  cap.position.z = 0.2;
-  joint.add(shell, cap);
-  parent.add(joint);
-  return joint;
-}
-
-function visible(point: Landmark | undefined) {
-  return point !== undefined && (point.visibility === undefined || point.visibility > 0.3);
-}
-
-function smoothLandmarks(previous: Landmark[], current: Landmark[], amount: number): Landmark[] {
-  return current.map((landmark, index) => {
-    const last = previous[index];
-    if (!last) return landmark;
-    const z = landmark.z ?? last.z;
-    return {
-      ...landmark,
-      x: last.x + (landmark.x - last.x) * amount,
-      y: last.y + (landmark.y - last.y) * amount,
-      z: z === undefined ? undefined : (last.z ?? z) + (z - (last.z ?? z)) * amount,
-    };
+  const blurMat = new THREE.ShaderMaterial({
+    uniforms: {
+      tInput: { value: brightRT.texture },
+      uStep: { value: new THREE.Vector2(1 / bw, 0) },
+    },
+    vertexShader: vs,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D tInput;
+      uniform vec2 uStep;
+      varying vec2 vUv;
+      void main() {
+        vec3 s = texture2D(tInput, vUv).rgb * 0.227027;
+        s += texture2D(tInput, vUv + uStep * 1.384615).rgb * 0.316216;
+        s += texture2D(tInput, vUv - uStep * 1.384615).rgb * 0.316216;
+        s += texture2D(tInput, vUv + uStep * 3.230769).rgb * 0.070270;
+        s += texture2D(tInput, vUv - uStep * 3.230769).rgb * 0.070270;
+        gl_FragColor = vec4(s, 1.0);
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
   });
-}
 
-function easeOut(value: number) {
-  const clamped = THREE.MathUtils.clamp(value, 0, 1);
-  return 1 - (1 - clamped) ** 3;
-}
+  // Single-pass ACES Filmic tone mapping + real-time body contact-shadow grounding + HDR bloom over <video>
+  const compositeMat = new THREE.ShaderMaterial({
+    uniforms: {
+      tScene: { value: sceneRT.texture },
+      tBloom: { value: blurBRT.texture },
+      uTexel: { value: new THREE.Vector2(1 / w, 1 / h) },
+      uBloomStrength: { value: 0.72 },
+    },
+    vertexShader: vs,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D tScene;
+      uniform sampler2D tBloom;
+      uniform vec2 uTexel;
+      uniform float uBloomStrength;
+      varying vec2 vUv;
 
-function createHudTexture() {
-  const canvas = document.createElement('canvas');
-  canvas.width = 256;
-  canvas.height = 256;
-  const context = canvas.getContext('2d');
-  if (!context) throw new Error('Le HUD holographique n’a pas pu être initialisé.');
+      vec3 acesFilm(vec3 x) {
+        const float a = 2.51;
+        const float b = 0.03;
+        const float c = 2.43;
+        const float d = 0.59;
+        const float e = 0.14;
+        return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+      }
 
-  context.strokeStyle = '#8beeff';
-  context.fillStyle = '#8beeff';
-  context.lineWidth = 1.2;
-  context.globalAlpha = 0.82;
-  [42, 63, 91].forEach((radius, index) => {
-    context.beginPath();
-    context.arc(128, 128, radius, 0.16 + index * 0.32, Math.PI * 1.78 + index * 0.2);
-    context.stroke();
+      vec3 toSrgb(vec3 l) {
+        return pow(max(l, vec3(1e-5)), vec3(1.0 / 2.2));
+      }
+
+      float solidAt(vec2 uv) {
+        return step(0.95, texture2D(tScene, uv).a);
+      }
+
+      void main() {
+        vec4 scene = texture2D(tScene, vUv);
+        vec3 bloom = texture2D(tBloom, vUv).rgb * uBloomStrength;
+
+        // Soft physical ambient-occlusion contact shadow cast by solid metal plates onto user's skin & clothes!
+        float shadow = 0.0;
+        if (scene.a < 0.96) {
+          vec2 r1 = uTexel * 4.5;
+          vec2 r2 = uTexel * 10.5;
+          float occ =
+            solidAt(vUv + vec2(r1.x, 0.0)) +
+            solidAt(vUv - vec2(r1.x, 0.0)) +
+            solidAt(vUv + vec2(0.0, r1.y)) +
+            solidAt(vUv - vec2(0.0, r1.y)) +
+            0.65 * solidAt(vUv + vec2(r2.x * 0.7, r2.y * 0.85)) +
+            0.65 * solidAt(vUv + vec2(-r2.x * 0.7, r2.y * 0.85)) +
+            0.55 * solidAt(vUv + vec2(r2.x * 0.7, -r2.y * 0.6)) +
+            0.55 * solidAt(vUv + vec2(-r2.x * 0.7, -r2.y * 0.6));
+          shadow = clamp((occ / 6.4) * 0.36 * (1.0 - scene.a), 0.0, 0.32);
+        }
+
+        if (scene.a > 0.995) {
+          vec3 mapped = toSrgb(acesFilm((scene.rgb + bloom) * 1.05));
+          gl_FragColor = vec4(mapped, 1.0);
+        } else {
+          vec3 baseLinear = scene.a > 1e-3 ? scene.rgb / scene.a : vec3(0.0);
+          vec3 basePremul = toSrgb(acesFilm(baseLinear * 1.05)) * scene.a;
+          vec3 bloomMapped = toSrgb(acesFilm(bloom * 1.1));
+          float outAlpha = clamp(scene.a + shadow, 0.0, 1.0);
+          gl_FragColor = vec4(clamp(basePremul + bloomMapped, 0.0, 1.0), outAlpha);
+        }
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
+    premultipliedAlpha: true,
   });
-  for (let index = 0; index < 48; index += 1) {
-    const angle = (index / 48) * Math.PI * 2;
-    const innerRadius = index % 4 === 0 ? 99 : 104;
-    const outerRadius = 111;
-    context.beginPath();
-    context.moveTo(128 + Math.cos(angle) * innerRadius, 128 + Math.sin(angle) * innerRadius);
-    context.lineTo(128 + Math.cos(angle) * outerRadius, 128 + Math.sin(angle) * outerRadius);
-    context.stroke();
-  }
-  context.font = '9px monospace';
-  context.fillText('ARMOR LINK', 92, 24);
-  context.fillText('BIOMETRIC', 94, 238);
-  context.globalAlpha = 1;
-  return new THREE.CanvasTexture(canvas);
+
+  const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const postScene = new THREE.Scene();
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), brightMat);
+  quad.frustumCulled = false;
+  postScene.add(quad);
+
+  return {
+    sceneRT,
+    brightRT,
+    blurART,
+    blurBRT,
+    postCam,
+    postScene,
+    quad,
+    brightMat,
+    blurMat,
+    compositeMat,
+    dispose: () => {
+      sceneRT.dispose();
+      brightRT.dispose();
+      blurART.dispose();
+      blurBRT.dispose();
+      brightMat.dispose();
+      blurMat.dispose();
+      compositeMat.dispose();
+      quad.geometry.dispose();
+    },
+  };
 }
 
-export class ArmorOverlay {
-  readonly renderer: THREE.WebGLRenderer;
+export class ArmorOverlayController {
+  private readonly canvas: HTMLCanvasElement;
+  private readonly getVideo: () => HTMLVideoElement | null;
+  private readonly getFrame: () => TrackingFrame;
+  private readonly onTelemetry?: (t: SuitTelemetry) => void;
 
-  private readonly scene = new THREE.Scene();
-  private readonly camera = new THREE.OrthographicCamera(0, 1, 0, 1, -100, 100);
-  private readonly composer: EffectComposer;
-  private readonly bloomPass: UnrealBloomPass;
-  private readonly cinematicPass: ShaderPass;
-  private readonly environmentMap: THREE.Texture;
-  private readonly hudTexture: THREE.CanvasTexture;
-  private readonly hudMaterial: THREE.MeshBasicMaterial;
-  private readonly faceHud: THREE.Mesh;
-  private readonly torso = new THREE.Group();
-  private readonly facePlate = new THREE.Group();
-  private readonly shoulders: THREE.Mesh[] = [];
-  private readonly upperArms: THREE.Mesh[] = [];
-  private readonly forearms: THREE.Mesh[] = [];
-  private readonly thighs: THREE.Mesh[] = [];
-  private readonly shins: THREE.Mesh[] = [];
-  private readonly boots: THREE.Mesh[] = [];
-  private readonly elbows: THREE.Group[] = [];
-  private readonly knees: THREE.Group[] = [];
-  private readonly hips: THREE.Group[] = [];
-  private readonly gauntlets: THREE.Mesh[] = [];
-  private readonly handHuds: THREE.Mesh[] = [];
-  private readonly waist = new THREE.Mesh();
-  private readonly palms: THREE.Group[] = [];
-  private readonly repulsorBolts: THREE.Group[] = [];
-  private readonly lastShotAt = [0, 0];
-  private readonly previousOpenHands = [false, false];
-  private readonly chestCore = new THREE.Group();
-  private readonly keyLight = new THREE.PointLight(0xffd2a0, 220, 1100);
-  private readonly nanites: THREE.InstancedMesh;
-  private readonly naniteDummy = new THREE.Object3D();
-  private readonly naniteTargets = Array.from({ length: 13 }, () => ({
-    point: new THREE.Vector3(),
-    delay: 0,
-    active: false,
-  }));
-  private readonly naniteOrigin = new THREE.Vector3();
-  private readonly neckCollar: THREE.Mesh;
-  private readonly suitUpDuration = 1900;
-  private previousTime = 0;
-  private suitUpStartedAt = -1;
-  private smoothedPose: Landmark[] = [];
-  private smoothedFace: Landmark[] = [];
-  private smoothedHands: Landmark[][] = [];
+  private renderer: THREE.WebGLRenderer | null = null;
+  private camera: THREE.OrthographicCamera | null = null;
+  private scene: THREE.Scene | null = null;
+  private envTex: THREE.Texture | null = null;
+  private mats: Mark85Materials | null = null;
+  private rig: FullBodyRig | null = null;
+  private post: PostPipeline | null = null;
+  private lightProbe = new WebcamLightProbe();
+
+  // Dynamic room-matched 3D lighting rig
+  private hemiLight: THREE.HemisphereLight | null = null;
+  private keyLight: THREE.DirectionalLight | null = null;
+  private rimLightLeft: THREE.DirectionalLight | null = null;
+  private rimLightRight: THREE.DirectionalLight | null = null;
+  private reactorLight: THREE.PointLight | null = null;
+  private repulsorLights: [THREE.PointLight, THREE.PointLight] | null = null;
+
   private width = 1;
   private height = 1;
-  private sourceWidth = 1;
-  private sourceHeight = 1;
+  private dpr = 1;
+  private rafId: number | null = null;
+  private lastNow = 0;
+  private elapsed = 0;
+  private lastTelemPush = 0;
 
-  constructor() {
-    this.renderer = new THREE.WebGLRenderer({
+  // One-Euro adaptive landmark filters
+  private poseFilter = new PointFilterBank(1.75, 0.045);
+  private worldFilter = new PointFilterBank(1.5, 0.035);
+  private faceFilter = new PointFilterBank(1.9, 0.052);
+  private handFilters = [new PointFilterBank(2.1, 0.06), new PointFilterBank(2.1, 0.06)];
+  private lastBodySeenAt = -10000;
+  private cachedPose: Landmark[] = [];
+  private cachedWorld: Landmark[] = [];
+  private cachedFace: Landmark[] = [];
+  private cachedHands: Landmark[][] = [];
+  private cachedOpen: boolean[] = [];
+
+  // Suit & Visor animation state
+  private suitPhase: SuitPhase = 'searching';
+  private suitProgress = SUIT_MIN_PROGRESS;
+  private visorOpen = false;
+  private visorProgress = VISOR_CLOSED;
+  private hasAutoEquipped = false;
+  private bodyLockTimer = 0;
+  private shockwaveTime = -10;
+  private chestHold = 0;
+  private chestCooldownUntil = 0;
+  private palmCharge: [number, number] = [0, 0];
+  private palmWasOpen: [boolean, boolean] = [false, false];
+
+  constructor(opts: {
+    canvas: HTMLCanvasElement;
+    getVideo: () => HTMLVideoElement | null;
+    getFrame: () => TrackingFrame;
+    onTelemetry?: (t: SuitTelemetry) => void;
+  }) {
+    this.canvas = opts.canvas;
+    this.getVideo = opts.getVideo;
+    this.getFrame = opts.getFrame;
+    this.onTelemetry = opts.onTelemetry;
+    this.init();
+  }
+
+  /** Replays the full chest-outward liquid-metal nanotech suit generation on your body! */
+  replaySuitUp() {
+    this.suitProgress = SUIT_MIN_PROGRESS;
+    this.suitPhase = 'equipping';
+    this.visorOpen = false;
+    this.visorProgress = VISOR_CLOSED;
+    this.shockwaveTime = this.elapsed;
+    this.hasAutoEquipped = true;
+    soundFx.playSuitUp();
+    this.emitTelemetry(true);
+  }
+
+  /** Toggles between equipping and retracting the suit into the Chest Arc Reactor. */
+  toggleSuit() {
+    if (this.suitPhase === 'equipped' || this.suitPhase === 'equipping') {
+      this.suitPhase = 'retracting';
+      this.shockwaveTime = this.elapsed;
+      soundFx.playSuitRetract();
+    } else {
+      if (this.suitProgress < -0.25) this.suitProgress = -0.25;
+      this.suitPhase = 'equipping';
+      this.shockwaveTime = this.elapsed;
+      this.hasAutoEquipped = true;
+      soundFx.playSuitUp();
+    }
+    this.emitTelemetry(true);
+  }
+
+  /** Retracts or closes the brushed-gold Mark 85 faceplate over your real face. */
+  toggleVisor() {
+    this.visorOpen = !this.visorOpen;
+    soundFx.playVisorToggle(!this.visorOpen);
+    this.emitTelemetry(true);
+  }
+
+  private init() {
+    const renderer = new THREE.WebGLRenderer({
+      canvas: this.canvas,
       alpha: true,
-      antialias: false,
-      preserveDrawingBuffer: false,
+      antialias: true,
+      premultipliedAlpha: true,
       powerPreference: 'high-performance',
     });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1));
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
-    this.renderer.setClearColor(0x000000, 0);
-    this.renderer.domElement.className = 'three-overlay';
-    this.renderer.domElement.setAttribute('aria-hidden', 'true');
+    renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+    renderer.toneMapping = THREE.NoToneMapping;
+    renderer.setClearColor(0x000000, 0);
+    this.renderer = renderer;
 
-    const roomEnvironment = new RoomEnvironment();
-    const pmremGenerator = new THREE.PMREMGenerator(this.renderer);
-    pmremGenerator.compileEquirectangularShader();
-    this.environmentMap = pmremGenerator.fromScene(roomEnvironment, 0.04).texture;
-    this.scene.environment = this.environmentMap;
-    this.scene.environmentIntensity = 1.2;
-    pmremGenerator.dispose();
-    roomEnvironment.dispose();
+    const scene = new THREE.Scene();
+    this.scene = scene;
 
-    this.composer = new EffectComposer(this.renderer);
-    this.composer.setPixelRatio(0.65);
-    this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(512, 288), 0.72, 0.34, 0.76);
-    this.bloomPass.blendMaterial.blending = THREE.CustomBlending;
-    this.bloomPass.blendMaterial.blendEquation = THREE.AddEquation;
-    this.bloomPass.blendMaterial.blendSrc = THREE.SrcAlphaFactor;
-    this.bloomPass.blendMaterial.blendDst = THREE.OneFactor;
-    this.bloomPass.blendMaterial.blendEquationAlpha = THREE.AddEquation;
-    this.bloomPass.blendMaterial.blendSrcAlpha = THREE.ZeroFactor;
-    this.bloomPass.blendMaterial.blendDstAlpha = THREE.OneFactor;
-    this.composer.addPass(this.bloomPass);
-    this.cinematicPass = new ShaderPass({
-      uniforms: {
-        tDiffuse: { value: null },
-        uResolution: { value: new THREE.Vector2(1, 1) },
-      },
-      vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
-      fragmentShader: `
-        uniform sampler2D tDiffuse;
-        uniform vec2 uResolution;
-        varying vec2 vUv;
-        vec3 linearToSrgb(vec3 color) {
-          vec3 lower = color * 12.92;
-          vec3 upper = 1.055 * pow(max(color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
-          return mix(upper, lower, step(color, vec3(0.0031308)));
-        }
-        void main() {
-          vec2 centered = (vUv - 0.5) * vec2(uResolution.x / max(uResolution.y, 1.0), 1.0);
-          float edge = length(centered);
-          vec2 aberration = centered * (0.0012 + edge * 0.0012);
-          vec4 base = texture2D(tDiffuse, vUv);
-          vec3 chromatic = vec3(
-            texture2D(tDiffuse, vUv + aberration).r,
-            base.g,
-            texture2D(tDiffuse, vUv - aberration).b
-          );
-          float vignette = 1.0 - smoothstep(0.42, 1.08, edge) * 0.16;
-          vec3 linearColor = chromatic * vignette;
-          gl_FragColor = vec4(linearToSrgb(linearColor / (linearColor + vec3(1.0))), base.a);
-        }
-      `,
-    });
-    this.composer.addPass(this.cinematicPass);
+    // High-contrast cinematic studio reflection environment (true metallic highlights & dark contrast ribs)
+    this.envTex = createStudioArmorEnvironment(renderer);
+    scene.environment = this.envTex;
 
-    this.hudTexture = createHudTexture();
-    this.hudTexture.colorSpace = THREE.SRGBColorSpace;
-    this.hudMaterial = new THREE.MeshBasicMaterial({
-      map: this.hudTexture,
-      color: 0x9aefff,
-      transparent: true,
-      opacity: 0.54,
-      blending: THREE.AdditiveBlending,
-      depthTest: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-      toneMapped: false,
-    });
-    this.faceHud = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.hudMaterial);
-    this.faceHud.visible = false;
-    this.scene.add(this.faceHud);
+    const camera = new THREE.OrthographicCamera(0, 1280, 720, 0, -2400, 2400);
+    camera.position.set(0, 0, 1200);
+    camera.lookAt(0, 0, 0);
+    this.camera = camera;
 
-    const naniteMaterial = new THREE.MeshBasicMaterial({
-      color: 0x9af5ff,
-      transparent: true,
-      opacity: 0.9,
-      blending: THREE.AdditiveBlending,
-      depthTest: false,
-      depthWrite: false,
-      toneMapped: false,
-    });
-    this.nanites = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(0.045, 0), naniteMaterial, 128);
-    this.nanites.frustumCulled = false;
-    this.nanites.renderOrder = 20;
-    this.scene.add(this.nanites);
+    // Physical lighting rig modulated every frame by the user's live room lighting
+    this.hemiLight = new THREE.HemisphereLight(0xf2f6ff, 0x261d18, 0.72);
+    this.keyLight = new THREE.DirectionalLight(0xfff5e8, 2.55);
+    this.keyLight.position.set(-340, 620, 880);
+    this.rimLightLeft = new THREE.DirectionalLight(0xbcd8ff, 1.35);
+    this.rimLightLeft.position.set(-850, 260, 260);
+    this.rimLightRight = new THREE.DirectionalLight(0xffe0b5, 1.25);
+    this.rimLightRight.position.set(850, 320, 280);
 
-    const chest = addPlate(
-      this.torso,
-      [
-        [-0.46, 0.45],
-        [-0.39, 0.52],
-        [0, 0.46],
-        [0.39, 0.52],
-        [0.46, 0.45],
-        [0.34, -0.2],
-        [0.22, -0.49],
-        [0, -0.55],
-        [-0.22, -0.49],
-        [-0.34, -0.2],
-      ],
-      armorShell,
-      1,
-    );
-    chest.material = armorShell;
-    const chestLine = new THREE.LineLoop(
-      new THREE.BufferGeometry().setFromPoints(
-        [
-          [-0.46, 0.45, 0],
-          [-0.39, 0.52, 0],
-          [0, 0.46, 0],
-          [0.39, 0.52, 0],
-          [0.46, 0.45, 0],
-          [0.34, -0.2, 0],
-          [0.22, -0.49, 0],
-          [0, -0.55, 0],
-          [-0.22, -0.49, 0],
-          [-0.34, -0.2, 0],
-        ].map(([x, y, z]) => new THREE.Vector3(x, y, z)),
-      ),
-      armorGold,
-    );
-    chestLine.position.z = 2;
-    this.torso.add(chestLine);
-
-    const core = new THREE.Mesh(
-      new THREE.CircleGeometry(0.13, 36),
-      energyMaterial,
-    );
-    const coreRing = new THREE.Mesh(
-      new THREE.TorusGeometry(0.18, 0.025, 8, 48),
-      lineMaterial,
-    );
-    const coreInnerRing = new THREE.Mesh(
-      new THREE.TorusGeometry(0.1, 0.012, 8, 40),
-      armorGold,
-    );
-    this.chestCore.add(core, coreRing, coreInnerRing);
-    this.chestCore.position.z = 4;
-    this.torso.add(this.chestCore);
-    addPlate(
-      this.torso,
-      [
-        [-0.38, 0.31],
-        [-0.3, 0.37],
-        [-0.16, -0.02],
-        [-0.2, -0.26],
-        [-0.33, -0.18],
-      ],
-      armorGold,
-      2,
-    );
-    addPlate(
-      this.torso,
-      [
-        [0.38, 0.31],
-        [0.3, 0.37],
-        [0.16, -0.02],
-        [0.2, -0.26],
-        [0.33, -0.18],
-      ],
-      armorGold,
-      2,
-    );
-    addPlate(
-      this.torso,
-      [
-        [-0.27, -0.34],
-        [0.27, -0.34],
-        [0.18, -0.44],
-        [-0.18, -0.44],
-      ],
-      armorSteel,
-      2,
-    );
-    this.scene.add(this.torso);
-    this.neckCollar = new THREE.Mesh(
-      new THREE.TorusGeometry(0.36, 0.075, 10, 40),
-      armorSteel,
-    );
-    this.neckCollar.name = 'neck-collar';
-    this.torso.add(this.neckCollar);
-
-    const shoulderShape: [number, number][] = [
-      [-0.5, 0.3],
-      [-0.24, 0.5],
-      [0.32, 0.4],
-      [0.5, -0.06],
-      [0.24, -0.43],
-      [-0.37, -0.34],
+    this.reactorLight = new THREE.PointLight(0x7beeff, 2.2, 620, 1.45);
+    this.repulsorLights = [
+      new THREE.PointLight(0x78ecff, 0, 560, 1.4),
+      new THREE.PointLight(0x78ecff, 0, 560, 1.4),
     ];
-    for (let index = 0; index < 2; index += 1) {
-      const shoulder = addPlate(this.scene, shoulderShape, armorGold, 2);
-      this.shoulders.push(shoulder);
+
+    scene.add(
+      this.hemiLight,
+      this.keyLight,
+      this.rimLightLeft,
+      this.rimLightRight,
+      this.reactorLight,
+      this.repulsorLights[0],
+      this.repulsorLights[1],
+    );
+
+    const mats = createMark85Materials();
+    this.mats = mats;
+
+    const root = new THREE.Group();
+    const reactor = buildArcReactor(mats);
+    const torso = buildTorso(mats);
+    const pelvis = buildPelvis(mats);
+    const neck = buildNeck(mats);
+    const helmet = buildHelmet(mats);
+    const pauldronL = buildPauldron(mats, -1);
+    const pauldronR = buildPauldron(mats, 1);
+    const upperArmL = buildUpperArm(mats);
+    const upperArmR = buildUpperArm(mats);
+    const elbowL = buildJoint(mats, 'elbow');
+    const elbowR = buildJoint(mats, 'elbow');
+    const forearmL = buildForearm(mats);
+    const forearmR = buildForearm(mats);
+    const hipL = buildJoint(mats, 'hip');
+    const hipR = buildJoint(mats, 'hip');
+    const thighL = buildThigh(mats);
+    const thighR = buildThigh(mats);
+    const kneeL = buildJoint(mats, 'knee');
+    const kneeR = buildJoint(mats, 'knee');
+    const shinL = buildShin(mats);
+    const shinR = buildShin(mats);
+    const bootL = buildBoot(mats);
+    const bootR = buildBoot(mats);
+    const fingerGeo = createFingerGeo();
+    const hand0 = buildHand(mats, reactor.glowTexture, fingerGeo);
+    const hand1 = buildHand(mats, reactor.glowTexture, fingerGeo);
+
+    root.add(
+      hipL,
+      hipR,
+      thighL,
+      thighR,
+      shinL,
+      shinR,
+      bootL,
+      bootR,
+      kneeL,
+      kneeR,
+      pelvis,
+      neck,
+      torso,
+      reactor.group,
+      upperArmL,
+      upperArmR,
+      pauldronL,
+      pauldronR,
+      forearmL,
+      forearmR,
+      elbowL,
+      elbowR,
+      helmet.group,
+    );
+
+    for (const h of [hand0, hand1]) {
+      root.add(h.gauntlet, h.repulsor, h.blastGroup);
+      h.fingers.forEach((f) => root.add(f));
+      h.shockRings.forEach((sr) => root.add(sr));
     }
 
-    const upperArmShape: [number, number][] = [
-      [-0.36, -0.5],
-      [0.36, -0.5],
-      [0.47, -0.28],
-      [0.35, 0.42],
-      [0.16, 0.5],
-      [-0.16, 0.5],
-      [-0.35, 0.35],
-      [-0.48, -0.28],
-    ];
-    const forearmShape: [number, number][] = [
-      [-0.32, -0.5],
-      [0.32, -0.5],
-      [0.45, -0.3],
-      [0.34, 0.36],
-      [0.18, 0.5],
-      [-0.18, 0.5],
-      [-0.34, 0.36],
-      [-0.45, -0.3],
-    ];
-    for (let index = 0; index < 2; index += 1) {
-      this.upperArms.push(addPlate(this.scene, upperArmShape, armorShell, 3));
-      this.forearms.push(addPlate(this.scene, forearmShape, armorShell, 4));
-      this.thighs.push(addPlate(this.scene, upperArmShape, armorGold, 2));
-      this.shins.push(addPlate(this.scene, forearmShape, armorShell, 3));
-      this.boots.push(addPlate(this.scene, forearmShape, armorSteel, 4));
-      this.elbows.push(addArmorJoint(this.scene));
-      this.knees.push(addArmorJoint(this.scene));
-      this.hips.push(addArmorJoint(this.scene));
-      const gauntlet = new THREE.Mesh(new THREE.SphereGeometry(0.5, 20, 14), armorShell);
-      this.scene.add(gauntlet);
-      this.gauntlets.push(gauntlet);
-    }
+    root.visible = false;
+    scene.add(root);
 
-    this.waist.geometry = makeShape([
-      [-0.5, 0.24],
-      [-0.43, 0.4],
-      [0.43, 0.4],
-      [0.5, 0.24],
-      [0.35, -0.32],
-      [0, -0.48],
-      [-0.35, -0.32],
-    ]);
-    this.waist.material = armorShell;
-    this.scene.add(this.waist);
+    this.rig = {
+      root,
+      reactor,
+      torso,
+      pelvis,
+      neck,
+      helmet,
+      pauldronL,
+      pauldronR,
+      upperArmL,
+      upperArmR,
+      elbowL,
+      elbowR,
+      forearmL,
+      forearmR,
+      hipL,
+      hipR,
+      thighL,
+      thighR,
+      kneeL,
+      kneeR,
+      shinL,
+      shinR,
+      bootL,
+      bootR,
+      hands: [hand0, hand1],
+      fingerGeo,
+    };
 
-    const brow = addPlate(
-      this.facePlate,
-      [
-        [-0.49, 0.15],
-        [-0.38, 0.42],
-        [0, 0.49],
-        [0.38, 0.42],
-        [0.49, 0.15],
-        [0.3, 0.02],
-        [-0.3, 0.02],
-      ],
-      armorGold,
-      2,
+    const rect = this.canvas.getBoundingClientRect();
+    this.width = Math.max(2, Math.round(rect.width || window.innerWidth || 1280));
+    this.height = Math.max(2, Math.round(rect.height || window.innerHeight || 720));
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    renderer.setPixelRatio(this.dpr);
+    renderer.setSize(this.width, this.height, false);
+    this.post = createPostPipeline(
+      renderer,
+      Math.max(2, Math.round(this.width * this.dpr)),
+      Math.max(2, Math.round(this.height * this.dpr)),
     );
-    const jaw = addPlate(
-      this.facePlate,
-      [
-        [-0.34, -0.16],
-        [-0.28, -0.42],
-        [0, -0.5],
-        [0.28, -0.42],
-        [0.34, -0.16],
-        [0.2, -0.06],
-        [-0.2, -0.06],
-      ],
-      armorShell,
-      2,
-    );
-    addPlate(
-      this.facePlate,
-      [
-        [-0.38, 0.06],
-        [-0.08, 0.12],
-        [-0.1, 0.18],
-        [-0.42, 0.13],
-      ],
-      energyMaterial,
-      4,
-    );
-    addPlate(
-      this.facePlate,
-      [
-        [0.38, 0.06],
-        [0.08, 0.12],
-        [0.1, 0.18],
-        [0.42, 0.13],
-      ],
-      energyMaterial,
-      4,
-    );
-    addPlate(
-      this.facePlate,
-      [
-        [-0.48, 0.2],
-        [-0.31, 0.42],
-        [-0.22, 0.23],
-        [-0.29, -0.02],
-      ],
-      armorSteel,
-      1,
-    );
-    addPlate(
-      this.facePlate,
-      [
-        [0.48, 0.2],
-        [0.31, 0.42],
-        [0.22, 0.23],
-        [0.29, -0.02],
-      ],
-      armorSteel,
-      1,
-    );
-    brow.material = armorGold;
-    jaw.material = armorShell;
-    this.scene.add(this.facePlate);
+    this.syncCamera();
 
-    for (let index = 0; index < 2; index += 1) {
-      const palm = new THREE.Group();
-      const outer = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.055, 10, 48), lineMaterial);
-      const inner = new THREE.Mesh(new THREE.TorusGeometry(0.32, 0.025, 8, 40), energyMaterial);
-      const center = new THREE.Mesh(new THREE.CircleGeometry(0.2, 32), energyMaterial);
-      palm.add(outer, inner, center);
-      palm.position.z = 6;
-      this.scene.add(palm);
-      this.palms.push(palm);
-
-      const handHud = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.hudMaterial);
-      handHud.visible = false;
-      this.scene.add(handHud);
-      this.handHuds.push(handHud);
-
-      const beam = new THREE.Group();
-      const glow = addPlate(
-        beam,
-        [
-          [-0.18, 0],
-          [0.18, 0],
-          [0.34, 1],
-          [0, 1.16],
-          [-0.34, 1],
-        ],
-        new THREE.MeshBasicMaterial({
-          color: 0x22bfff,
-          transparent: true,
-          opacity: 0.22,
-          depthTest: false,
-          blending: THREE.AdditiveBlending,
-        }),
-        0,
-      );
-      const bolt = addPlate(
-        beam,
-        [
-          [-0.055, 0],
-          [0.055, 0],
-          [0.15, 0.94],
-          [0, 1.04],
-          [-0.15, 0.94],
-        ],
-        new THREE.MeshBasicMaterial({
-          color: 0xc8fbff,
-          transparent: true,
-          opacity: 0.96,
-          depthTest: false,
-          blending: THREE.AdditiveBlending,
-        }),
-        0.2,
-      );
-      glow.name = 'repulsor-glow';
-      bolt.name = 'repulsor-bolt';
-      beam.visible = false;
-      this.scene.add(beam);
-      this.repulsorBolts.push(beam);
-    }
-
-    this.scene.add(new THREE.AmbientLight(0xffe6d3, 2.2));
-    this.keyLight.position.set(-this.width * 0.5, -this.height * 0.4, 220);
-    this.scene.add(this.keyLight);
-    const fillLight = new THREE.PointLight(0x66dfff, 160, 900);
-    fillLight.position.set(this.width * 0.55, -this.height * 0.2, 180);
-    this.scene.add(fillLight);
-    const rimLight = new THREE.PointLight(0xe6424f, 130, 800);
-    rimLight.position.set(0, this.height * 0.7, 120);
-    this.scene.add(rimLight);
+    this.lastNow = performance.now();
+    this.rafId = requestAnimationFrame(this.tick);
   }
 
-  resize(width: number, height: number, sourceWidth = this.sourceWidth, sourceHeight = this.sourceHeight) {
-    this.width = Math.max(width, 1);
-    this.height = Math.max(height, 1);
-    this.sourceWidth = Math.max(sourceWidth, 1);
-    this.sourceHeight = Math.max(sourceHeight, 1);
+  private syncSize() {
+    const renderer = this.renderer;
+    if (!renderer) return;
+    const rect = this.canvas.getBoundingClientRect();
+    const w = Math.max(2, Math.round(rect.width));
+    const h = Math.max(2, Math.round(rect.height));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (w === this.width && h === this.height && dpr === this.dpr) return;
+
+    this.width = w;
+    this.height = h;
+    this.dpr = dpr;
+    renderer.setPixelRatio(dpr);
+    renderer.setSize(w, h, false);
+
+    const pw = Math.max(2, Math.round(w * dpr));
+    const ph = Math.max(2, Math.round(h * dpr));
+    if (this.post) {
+      this.post.sceneRT.setSize(pw, ph);
+      this.post.brightRT.setSize(Math.max(2, pw >> 1), Math.max(2, ph >> 1));
+      this.post.blurART.setSize(Math.max(2, pw >> 1), Math.max(2, ph >> 1));
+      this.post.blurBRT.setSize(Math.max(2, pw >> 1), Math.max(2, ph >> 1));
+      this.post.compositeMat.uniforms.uTexel.value.set(1 / pw, 1 / ph);
+    }
+    this.syncCamera();
+  }
+
+  private syncCamera() {
+    if (!this.camera) return;
     this.camera.left = 0;
     this.camera.right = this.width;
-    this.camera.top = 0;
-    this.camera.bottom = this.height;
+    this.camera.top = this.height;
+    this.camera.bottom = 0;
     this.camera.updateProjectionMatrix();
-    this.renderer.setSize(this.width, this.height, false);
-    this.composer.setSize(this.width, this.height);
-    this.cinematicPass.uniforms.uResolution.value.set(this.renderer.domElement.width, this.renderer.domElement.height);
-    this.keyLight.position.set(this.width * 0.24, this.height * 0.14, 220);
   }
 
-  private mapPoint(landmark: Landmark) {
-    const coverScale = Math.max(this.width / this.sourceWidth, this.height / this.sourceHeight);
-    const cropX = (this.sourceWidth * coverScale - this.width) / 2;
-    const cropY = (this.sourceHeight * coverScale - this.height) / 2;
-    return new THREE.Vector3(
-      landmark.x * this.sourceWidth * coverScale - cropX,
-      landmark.y * this.sourceHeight * coverScale - cropY,
-      1,
-    );
+  private getCover(): CoverTransform {
+    const v = this.getVideo();
+    const vw = v && v.videoWidth > 0 ? v.videoWidth : 1280;
+    const vh = v && v.videoHeight > 0 ? v.videoHeight : 720;
+    const scale = Math.max(this.width / vw, this.height / vh);
+    return {
+      scale,
+      offsetX: (vw * scale - this.width) * 0.5,
+      offsetY: (vh * scale - this.height) * 0.5,
+    };
   }
 
-  private setNaniteTarget(index: number, landmark: Landmark | undefined, delay: number) {
-    const target = this.naniteTargets[index];
-    if (!landmark || !visible(landmark)) {
-      target.active = false;
+  /** Projects a MediaPipe normalized landmark onto mirrored fullscreen `<video>` pixel space. */
+  private proj(lm: Landmark, cover: CoverTransform, bodyScale: number): ScreenPt {
+    const v = this.getVideo();
+    const vw = v && v.videoWidth > 0 ? v.videoWidth : 1280;
+    const vh = v && v.videoHeight > 0 ? v.videoHeight : 720;
+    // Mirror horizontally to match CSS scaleX(-1) selfie camera!
+    const x = (1 - lm.x) * vw * cover.scale - cover.offsetX;
+    const yCss = lm.y * vh * cover.scale - cover.offsetY;
+    const y = this.height - yCss;
+    const z = THREE.MathUtils.clamp(-(lm.z ?? 0) * bodyScale * 0.34, -240, 240);
+    return { x, y, z, vis: lm.visibility ?? 1 };
+  }
+
+  private placeLimb(
+    obj: THREE.Object3D,
+    a: ScreenPt,
+    b: ScreenPt,
+    widthPx: number,
+    zLayer: number,
+    depthScale = 0.72,
+    lengthMul = 1.12,
+  ) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dz = b.z - a.z;
+    const len2D = Math.hypot(dx, dy);
+    if (len2D < 5) {
+      obj.visible = false;
       return;
     }
-
-    target.point.copy(this.mapPoint(landmark));
-    target.delay = delay;
-    target.active = true;
+    obj.visible = true;
+    obj.position.set((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5 + zLayer);
+    const roll = Math.atan2(dy, dx) - Math.PI * 0.5;
+    // Subtle 3D foreshortening tilt when limb points toward camera (e.g. aiming palm repulsor!)
+    const pitch = THREE.MathUtils.clamp(-Math.atan2(dz, Math.max(len2D, widthPx * 0.7)) * 0.35, -0.45, 0.45);
+    obj.rotation.set(pitch, 0, roll);
+    // Keep realistic minimum segment length when pointing arm straight at camera
+    const segLen = Math.max(len2D * lengthMul, widthPx * 0.72);
+    obj.scale.set(widthPx, segLen, widthPx * depthScale);
   }
 
-  update(
+  private adaptRoomLighting(now: number, dt: number) {
+    const v = this.getVideo();
+    if (!v || !this.mats || !this.keyLight || !this.hemiLight) return;
+    this.lightProbe.sample(v, now, dt);
+    const probe = this.lightProbe;
+
+    // Match key-light direction & exposure to actual room brightness and window/lamp side!
+    const exposure = THREE.MathUtils.lerp(0.68, 1.24, probe.luminance);
+    this.keyLight.intensity = 2.45 * exposure;
+    this.keyLight.color.setRGB(
+      THREE.MathUtils.lerp(1, probe.tint.r, 0.72),
+      THREE.MathUtils.lerp(1, probe.tint.g, 0.72),
+      THREE.MathUtils.lerp(1, probe.tint.b, 0.72),
+    );
+    // Note: video is mirrored horizontally, so flip dirX to match mirrored screen space!
+    this.keyLight.position.set(
+      this.width * 0.5 - probe.dirX * this.width * 0.85,
+      this.height * 0.55 + probe.dirY * this.height * 0.65,
+      860,
+    );
+
+    this.hemiLight.intensity = 0.7 * exposure;
+    const roomScale = THREE.MathUtils.lerp(0.8, 1.08, probe.luminance);
+    this.mats.uniforms.uRoomTint.value.setRGB(
+      probe.tint.r * roomScale,
+      probe.tint.g * roomScale,
+      probe.tint.b * roomScale,
+    );
+  }
+
+  private tick = (now: number) => {
+    const dt = Math.min(0.05, Math.max(0.001, (now - this.lastNow) / 1000));
+    this.lastNow = now;
+    this.elapsed += dt;
+
+    this.syncSize();
+    this.adaptRoomLighting(now, dt);
+
+    const frame = this.getFrame();
+    const rawPose = frame.pose;
+    const hasFreshBody =
+      rawPose.length >= 25 &&
+      (rawPose[11]?.visibility ?? 0) > 0.32 &&
+      (rawPose[12]?.visibility ?? 0) > 0.32;
+
+    if (hasFreshBody) {
+      this.lastBodySeenAt = now;
+      this.cachedPose = this.poseFilter.update(rawPose, dt);
+      this.cachedWorld = frame.worldPose.length >= 25 ? this.worldFilter.update(frame.worldPose, dt) : [];
+      this.cachedFace = frame.face.length >= 455 ? this.faceFilter.update(frame.face, dt) : [];
+      this.cachedHands = frame.hands.slice(0, 2).map((h, i) => this.handFilters[i].update(h, dt));
+      this.cachedOpen = frame.openHands;
+    } else if (now - this.lastBodySeenAt > BODY_GRACE_MS) {
+      this.poseFilter.reset();
+      this.worldFilter.reset();
+      this.faceFilter.reset();
+      this.handFilters[0].reset();
+      this.handFilters[1].reset();
+      this.bodyLockTimer = 0;
+    }
+
+    const bodyActive = now - this.lastBodySeenAt <= BODY_GRACE_MS && this.cachedPose.length >= 25;
+
+    // Auto-equip full Mark 85 nanotech suit right after locking onto the user's real body!
+    if (bodyActive && !this.hasAutoEquipped) {
+      this.bodyLockTimer += dt;
+      if (this.bodyLockTimer >= 0.32) {
+        this.hasAutoEquipped = true;
+        this.suitProgress = -0.26;
+        this.suitPhase = 'equipping';
+        this.visorOpen = false;
+        this.visorProgress = VISOR_CLOSED;
+        this.shockwaveTime = this.elapsed;
+        soundFx.playSuitUp();
+      }
+    }
+
+    // Advance nanotech suit wavefront
+    if (this.suitPhase === 'equipping') {
+      const accel = 0.85 + 0.34 * THREE.MathUtils.smoothstep(this.suitProgress, -0.2, 2.2);
+      this.suitProgress = Math.min(SUIT_MAX_PROGRESS, this.suitProgress + dt * SUIT_UP_SPEED * accel);
+      if (this.suitProgress >= SUIT_MAX_PROGRESS) {
+        this.suitPhase = 'equipped';
+      }
+    } else if (this.suitPhase === 'retracting') {
+      this.suitProgress = Math.max(SUIT_MIN_PROGRESS, this.suitProgress - dt * SUIT_DOWN_SPEED);
+      if (this.suitProgress <= SUIT_MIN_PROGRESS) {
+        this.suitPhase = 'retracted';
+      }
+    } else if (!bodyActive && !this.hasAutoEquipped) {
+      this.suitPhase = 'searching';
+    }
+
+    const targetVisor = this.visorOpen ? VISOR_OPEN : VISOR_CLOSED;
+    this.visorProgress = THREE.MathUtils.lerp(this.visorProgress, targetVisor, 1 - Math.exp(-dt * 7.2));
+
+    if (this.mats) {
+      const u = this.mats.uniforms;
+      u.uArmorTime.value = this.elapsed;
+      u.uNanoProgress.value = this.suitProgress;
+      u.uVisorProgress.value = this.visorProgress;
+      u.uDirectionSign.value = this.suitPhase === 'retracting' ? -1 : 1;
+    }
+
+    if (this.rig) {
+      if (bodyActive) {
+        this.rig.root.visible = true;
+        this.updateBodyRig(this.cachedPose, this.cachedWorld, this.cachedFace, frame.faceMatrix, this.cachedHands, this.cachedOpen, dt, now);
+      } else {
+        this.rig.root.visible = false;
+      }
+    }
+
+    this.renderFrame();
+    this.emitTelemetry(false);
+    this.rafId = requestAnimationFrame(this.tick);
+  };
+
+  private updateBodyRig(
     pose: Landmark[],
+    worldPose: Landmark[],
     face: Landmark[],
+    faceMatrix: number[] | null,
     hands: Landmark[][],
     openHands: boolean[],
-    options: OverlayOptions,
-    time: number,
+    dt: number,
+    now: number,
   ) {
-    const delta = this.previousTime === 0 ? 1 / 60 : THREE.MathUtils.clamp((time - this.previousTime) / 1000, 0, 0.1);
-    this.previousTime = time;
-    this.smoothedPose = smoothLandmarks(this.smoothedPose, pose, 1 - Math.exp(-delta / 0.038));
-    this.smoothedFace = smoothLandmarks(this.smoothedFace, face, 1 - Math.exp(-delta / 0.055));
-    this.smoothedHands = hands.map((hand, index) =>
-      smoothLandmarks(this.smoothedHands[index] ?? [], hand, 1 - Math.exp(-delta / 0.032)),
+    const rig = this.rig;
+    const mats = this.mats;
+    if (!rig || !mats) return;
+
+    const cover = this.getCover();
+    const shL0 = this.proj(pose[11], cover, 220);
+    const shR0 = this.proj(pose[12], cover, 220);
+    const shoulder2D = Math.hypot(shL0.x - shR0.x, shL0.y - shR0.y);
+
+    // Compute true 3D body yaw from MediaPipe metric worldLandmarks so turning sideways keeps true armor volume!
+    let torsoYaw = 0;
+    if (worldPose.length >= 13) {
+      const wL = worldPose[11];
+      const wR = worldPose[12];
+      const wLz = wL.z ?? 0;
+      const wRz = wR.z ?? 0;
+      const wSpan = Math.max(Math.hypot(wL.x - wR.x, wLz - wRz), 0.18);
+      // Mirrored selfie X: positive yaw turns right shoulder toward camera
+      torsoYaw = THREE.MathUtils.clamp(
+        Math.asin(THREE.MathUtils.clamp((wLz - wRz) / wSpan, -0.82, 0.82)) * 0.62,
+        -0.6,
+        0.6,
+      );
+    } else {
+      torsoYaw = THREE.MathUtils.clamp(((pose[11].z ?? 0) - (pose[12].z ?? 0)) * 1.1, -0.55, 0.55);
+    }
+
+    // Recover un-foreshortened physical shoulder span so armor never squashes flat when user turns 45°!
+    const bodyScale = Math.max(48, shoulder2D / Math.max(Math.cos(torsoYaw), 0.62));
+
+    const shL = this.proj(pose[11], cover, bodyScale);
+    const shR = this.proj(pose[12], cover, bodyScale);
+    const shMid: ScreenPt = {
+      x: (shL.x + shR.x) * 0.5,
+      y: (shL.y + shR.y) * 0.5,
+      z: (shL.z + shR.z) * 0.5,
+      vis: 1,
+    };
+
+    // Shoulder axis right vector & perpendicular up vector
+    const sdx = shL.x - shR.x; // shL (person's left) is on screen RIGHT in mirrored selfie view
+    const sdy = shL.y - shR.y;
+    const sLen = Math.max(Math.hypot(sdx, sdy), 1);
+    const rx = sdx / sLen;
+    const ry = sdy / sLen;
+    const ux = -ry;
+    const uy = rx;
+
+    // Robust full-body hip anchors: use real tracked hips when clearly visible, smoothly blend with anatomical
+    // spine estimate when sitting/standing close to a PC webcam so chest & abs stay 100% full-size!
+    const rawHipL = this.proj(pose[23], cover, bodyScale);
+    const rawHipR = this.proj(pose[24], cover, bodyScale);
+    const hipConf = Math.min(rawHipL.vis, rawHipR.vis);
+    const hipInView = rawHipL.y > -bodyScale * 0.35 && rawHipR.y > -bodyScale * 0.35;
+    const estSpineLen = bodyScale * 1.48;
+    const estHipHalf = bodyScale * 0.39 * Math.cos(torsoYaw);
+    const estHipMidX = shMid.x - ux * estSpineLen;
+    const estHipMidY = shMid.y - uy * estSpineLen;
+
+    const hipWeight = hipInView ? THREE.MathUtils.smoothstep(hipConf, 0.32, 0.72) : 0;
+    const hipL: ScreenPt = {
+      x: THREE.MathUtils.lerp(estHipMidX + rx * estHipHalf, rawHipL.x, hipWeight),
+      y: THREE.MathUtils.lerp(estHipMidY + ry * estHipHalf, rawHipL.y, hipWeight),
+      z: THREE.MathUtils.lerp(shMid.z, rawHipL.z, hipWeight),
+      vis: rawHipL.vis,
+    };
+    const hipR: ScreenPt = {
+      x: THREE.MathUtils.lerp(estHipMidX - rx * estHipHalf, rawHipR.x, hipWeight),
+      y: THREE.MathUtils.lerp(estHipMidY - ry * estHipHalf, rawHipR.y, hipWeight),
+      z: THREE.MathUtils.lerp(shMid.z, rawHipR.z, hipWeight),
+      vis: rawHipR.vis,
+    };
+    const hipMid: ScreenPt = {
+      x: (hipL.x + hipR.x) * 0.5,
+      y: (hipL.y + hipR.y) * 0.5,
+      z: (hipL.z + hipR.z) * 0.5,
+      vis: hipConf,
+    };
+
+    const spineDx = shMid.x - hipMid.x;
+    const spineDy = shMid.y - hipMid.y;
+    const rawTorsoLen = Math.hypot(spineDx, spineDy);
+    const torsoLen = THREE.MathUtils.clamp(rawTorsoLen, bodyScale * 1.18, bodyScale * 1.95);
+    const torsoRoll = Math.atan2(spineDy, spineDx) - Math.PI * 0.5;
+    const torsoPitch = THREE.MathUtils.clamp(
+      -Math.atan2(shMid.z - hipMid.z, Math.max(torsoLen, 40)) * 0.4,
+      -0.32,
+      0.32,
     );
-    this.bloomPass.strength = 0.58 * options.intensity;
-    pulsingMaterials.forEach((material) => {
-      const shader = material.userData.pulseShader;
-      if (shader?.uniforms.uArmorTime) shader.uniforms.uArmorTime.value = time * 0.001;
-    });
 
-    const currentPose = this.smoothedPose;
-    const currentFace = this.smoothedFace;
-    const currentHands = this.smoothedHands;
-    const point = (landmark: Landmark) => this.mapPoint(landmark);
-    const reveal = (delay: number) =>
-      this.suitUpStartedAt < 0
-        ? 0
-        : easeOut((time - this.suitUpStartedAt - delay * this.suitUpDuration) / (this.suitUpDuration * 0.14));
+    // Broad anatomical Mark 85 torso sizing so 100% of the user's real shoulders, chest, ribs & shirt are armored!
+    const torsoW = bodyScale * 1.56;
+    const torsoH = torsoLen * 1.24;
+    const torsoD = bodyScale * 0.72;
+    const torsoCx = THREE.MathUtils.lerp(hipMid.x, shMid.x, 0.56);
+    const torsoCy = THREE.MathUtils.lerp(hipMid.y, shMid.y, 0.56);
+    const torsoCz = (shMid.z + hipMid.z) * 0.5 + 12;
 
-    const leftShoulder = currentPose[11];
-    const rightShoulder = currentPose[12];
-    const leftHip = currentPose[23];
-    const rightHip = currentPose[24];
+    rig.torso.visible = true;
+    rig.torso.position.set(torsoCx, torsoCy, torsoCz);
+    rig.torso.rotation.set(torsoPitch, torsoYaw, torsoRoll);
+    rig.torso.scale.set(torsoW, torsoH, torsoD);
+    rig.torso.updateMatrixWorld(true);
 
-    const hasShoulders = visible(leftShoulder) && visible(rightShoulder);
-    const hasHips = visible(leftHip) && visible(rightHip);
-    if (hasShoulders && this.suitUpStartedAt < 0) this.suitUpStartedAt = time;
-    this.naniteTargets.forEach((target) => {
-      target.active = false;
-    });
-    this.setNaniteTarget(0, leftShoulder, 0.03);
-    this.setNaniteTarget(1, rightShoulder, 0.03);
-    this.setNaniteTarget(2, currentPose[13], 0.14);
-    this.setNaniteTarget(3, currentPose[14], 0.14);
-    this.setNaniteTarget(4, currentPose[15], 0.23);
-    this.setNaniteTarget(5, currentPose[16], 0.23);
-    this.setNaniteTarget(6, leftHip, 0.34);
-    this.setNaniteTarget(7, rightHip, 0.34);
-    this.setNaniteTarget(8, currentPose[25], 0.43);
-    this.setNaniteTarget(9, currentPose[26], 0.43);
-    this.setNaniteTarget(10, currentPose[27], 0.54);
-    this.setNaniteTarget(11, currentPose[28], 0.54);
-    this.setNaniteTarget(12, currentFace[10], 0.67);
+    // ── Chest Arc Reactor Nano-Unit (exact Cartesian Caramel origin Empty on sternum!) ──
+    const reactorWorld = new THREE.Vector3(0, 0.215, 0.505).applyMatrix4(rig.torso.matrixWorld);
+    const reactorSize = bodyScale * 0.285;
+    rig.reactor.group.visible = true;
+    rig.reactor.group.position.copy(reactorWorld);
+    rig.reactor.group.rotation.set(torsoPitch, torsoYaw, torsoRoll);
+    rig.reactor.group.scale.setScalar(reactorSize);
+    rig.reactor.innerRing.rotation.z = this.elapsed * 0.85;
 
-    if (hasShoulders) {
-      const shoulderCenter = point(leftShoulder).lerp(point(rightShoulder), 0.5);
-      const shoulderWidth = point(leftShoulder).distanceTo(point(rightShoulder));
-      const hipCenter = hasHips
-        ? point(leftHip).lerp(point(rightHip), 0.5)
-        : shoulderCenter.clone().add(new THREE.Vector3(0, shoulderWidth * 1.12, 0));
-      const center = shoulderCenter.clone().lerp(hipCenter, 0.48);
-      const torsoHeight = shoulderCenter.distanceTo(hipCenter);
-      this.naniteOrigin.set(center.x, center.y, 13);
-      this.torso.position.set(center.x, center.y, 4);
-      const torsoReveal = reveal(0);
-      this.torso.visible = options.armor && options.body && torsoReveal > 0;
-      this.torso.rotation.z = Math.atan2(
-        rightShoulder.y - leftShoulder.y,
-        rightShoulder.x - leftShoulder.x,
-      );
-      this.torso.scale.set(shoulderWidth * 0.95 * torsoReveal, torsoHeight * 1.02 * torsoReveal, 1);
-      this.chestCore.position.set(0, 0.02, 4);
-      this.chestCore.rotation.z = time * 0.0007;
-      this.chestCore.scale.setScalar(1 + Math.sin(time * 0.004) * 0.045);
-      this.chestCore.visible = options.armor && options.effects && options.body && torsoReveal > 0.05;
+    const pulse = 0.5 + 0.5 * Math.sin(this.elapsed * 3.4);
+    const formingBoost = this.suitPhase === 'equipping' || this.suitPhase === 'retracting' ? 0.35 : 0;
+    rig.reactor.coronaMat.opacity = 0.56 + 0.14 * pulse + formingBoost;
+    rig.reactor.corona.scale.setScalar(0.95 + 0.1 * pulse + formingBoost * 0.35);
 
-      [leftShoulder, rightShoulder].forEach((shoulder, index) => {
-        const target = point(shoulder);
-        const plate = this.shoulders[index];
-        const shoulderReveal = reveal(0.03);
-        plate.visible = options.armor && options.body && shoulderReveal > 0;
-        plate.position.set(target.x, target.y, 7);
-        plate.scale.set(shoulderWidth * 0.34 * shoulderReveal, shoulderWidth * 0.3 * shoulderReveal, 1);
-      });
-
-      const collarReveal = reveal(0.58);
-      this.neckCollar.position.set(
-        shoulderCenter.x,
-        shoulderCenter.y + (hipCenter.y - shoulderCenter.y) * -0.16,
-        9,
-      );
-      this.neckCollar.scale.set(shoulderWidth * 0.44 * collarReveal, shoulderWidth * 0.17 * collarReveal, 1);
-      this.neckCollar.visible = options.armor && options.body && collarReveal > 0;
-
-      const waistReveal = reveal(0.34);
-      this.waist.visible = options.armor && options.body && hasHips && waistReveal > 0;
-      if (hasHips) {
-        this.waist.position.set(hipCenter.x, hipCenter.y, 8);
-        this.waist.rotation.z = Math.atan2(
-          rightHip.y - leftHip.y,
-          rightHip.x - leftHip.x,
-        );
-        this.waist.scale.set(shoulderWidth * 0.56 * waistReveal, torsoHeight * 0.3 * waistReveal, 1);
-      }
+    const swAge = this.elapsed - this.shockwaveTime;
+    if (swAge >= 0 && swAge < 0.72) {
+      const t = swAge / 0.72;
+      rig.reactor.shockwave.visible = true;
+      rig.reactor.shockwave.scale.setScalar(0.55 + Math.pow(t, 0.52) * 5.6);
+      rig.reactor.shockwaveMat.opacity = (1 - t) * (1 - t) * 0.82;
     } else {
-      this.shoulders.forEach((shoulder) => (shoulder.visible = false));
-      this.waist.visible = false;
-      this.neckCollar.visible = false;
-      this.chestCore.visible = false;
+      rig.reactor.shockwave.visible = false;
     }
 
-    const limbPoints: [number, number, THREE.Mesh, number, number, number][] = [
-      [11, 13, this.upperArms[0], 0.4, 1.1, 0.1],
-      [12, 14, this.upperArms[1], 0.4, 1.1, 0.1],
-      [13, 15, this.forearms[0], 0.42, 1.12, 0.22],
-      [14, 16, this.forearms[1], 0.42, 1.12, 0.22],
-      [23, 25, this.thighs[0], 0.5, 1.08, 0.34],
-      [24, 26, this.thighs[1], 0.5, 1.08, 0.34],
-      [25, 27, this.shins[0], 0.43, 1.12, 0.44],
-      [26, 28, this.shins[1], 0.43, 1.12, 0.44],
-      [27, 31, this.boots[0], 0.58, 1.3, 0.55],
-      [28, 32, this.boots[1], 0.58, 1.3, 0.55],
-    ];
-    limbPoints.forEach(([startIndex, endIndex, plate, widthRatio, lengthRatio, delay]) => {
-      const startLandmark = currentPose[startIndex];
-      const endLandmark = currentPose[endIndex];
-      const stageProgress = reveal(delay);
-      plate.visible =
-        options.armor && options.body && stageProgress > 0 && visible(startLandmark) && visible(endLandmark);
-      if (plate.visible) {
-        const start = point(startLandmark);
-        const end = point(endLandmark);
-        const length = start.distanceTo(end);
-        plate.position.copy(start.clone().add(end).multiplyScalar(0.5));
-        plate.rotation.z = Math.atan2(end.y - start.y, end.x - start.x) - Math.PI / 2;
-        plate.scale.set(length * widthRatio * stageProgress, length * lengthRatio * stageProgress, 1);
-      }
-    });
+    mats.uniforms.uNanoOrigin.value.copy(reactorWorld);
+    mats.uniforms.uBodyScale.value = bodyScale;
 
-    const jointPoints: [number, THREE.Group, number, number][] = [
-      [13, this.elbows[0], 11, 0.18],
-      [14, this.elbows[1], 11, 0.18],
-      [25, this.knees[0], 23, 0.4],
-      [26, this.knees[1], 24, 0.4],
-      [23, this.hips[0], 24, 0.35],
-      [24, this.hips[1], 23, 0.35],
-    ];
-    jointPoints.forEach(([landmarkIndex, joint, referenceIndex, delay]) => {
-      const landmark = currentPose[landmarkIndex];
-      const reference = currentPose[referenceIndex];
-      const stageProgress = reveal(delay);
-      joint.visible =
-        options.armor && options.body && stageProgress > 0 && visible(landmark) && visible(reference);
-      if (!joint.visible) return;
-      const target = point(landmark);
-      const referencePoint = point(reference);
-      const scale = target.distanceTo(referencePoint) * (landmarkIndex < 20 ? 0.34 : 0.5) * stageProgress;
-      joint.position.set(target.x, target.y, landmarkIndex < 20 ? 10 : 8);
-      joint.scale.set(scale, scale * 0.78, scale * 0.3);
-    });
-
-    const faceTop = currentFace[10];
-    const faceBottom = currentFace[152];
-    const faceLeft = currentFace[234];
-    const faceRight = currentFace[454];
-    const faceReveal = reveal(0.67);
-    this.facePlate.visible = options.armor && options.face && faceReveal > 0;
-    if (visible(faceTop) && visible(faceBottom) && visible(faceLeft) && visible(faceRight)) {
-      const topPoint = point(faceTop);
-      const bottomPoint = point(faceBottom);
-      const leftPoint = point(faceLeft);
-      const rightPoint = point(faceRight);
-      const faceCenter = topPoint.clone().lerp(bottomPoint, 0.5);
-      const faceWidth = leftPoint.distanceTo(rightPoint);
-      const faceHeight = topPoint.distanceTo(bottomPoint);
-      this.facePlate.position.set(faceCenter.x, faceCenter.y, 10);
-      this.facePlate.rotation.z = Math.atan2(
-        faceRight.y - faceLeft.y,
-        faceRight.x - faceLeft.x,
-      );
-      this.facePlate.scale.set(faceWidth * 0.9 * faceReveal, faceHeight * 0.76 * faceReveal, 1);
-      this.faceHud.visible = options.effects && faceReveal > 0;
-      this.faceHud.position.set(faceCenter.x, faceCenter.y - faceHeight * 0.08, 9);
-      this.faceHud.rotation.z = this.facePlate.rotation.z;
-      this.faceHud.scale.set(faceWidth * 1.48, faceWidth * 1.48, 1);
-    } else {
-      this.facePlate.visible = false;
-      this.faceHud.visible = false;
+    if (this.reactorLight) {
+      this.reactorLight.position.set(reactorWorld.x, reactorWorld.y, reactorWorld.z + bodyScale * 0.45);
+      this.reactorLight.distance = bodyScale * 3.4;
+      this.reactorLight.intensity = 2.1 + pulse * 0.55 + formingBoost * 1.8;
     }
 
-    this.palms.forEach((palm, index) => {
-      const hand = currentHands[index];
-      const palmCenter = hand?.[9];
-      const hasHand = !!palmCenter && !!hand?.[5] && !!hand[17];
-      const isOpen = hasHand && !!openHands[index];
-      const handHud = this.handHuds[index];
-      handHud.visible = options.effects && options.hands && hasHand;
-      this.gauntlets[index].visible = options.armor && options.hands && hasHand && reveal(0.22) > 0;
-      palm.visible = options.armor && options.hands && !!palmCenter;
-      this.repulsorBolts[index].visible =
-        options.armor &&
-        options.hands &&
-        options.effects &&
-        isOpen &&
-        time - this.lastShotAt[index] < 280;
-      if (!palmCenter || !hand?.[5] || !hand[17]) {
-        this.previousOpenHands[index] = false;
-        return;
-      }
-      const center = point(palmCenter);
-      const indexTip = point(hand[8]);
-      const wrist = point(hand[0]);
-      const middleKnuckle = point(hand[9]);
-      const handSpan = point(hand[5]).distanceTo(point(hand[17]));
-      const wristToPalm = middleKnuckle.clone().sub(wrist);
-      const wristToPalmLength = Math.max(wristToPalm.length(), 1);
-      const handAngle = Math.atan2(wristToPalm.y, wristToPalm.x) - Math.PI / 2;
-      const gloveCenter = wrist.clone().lerp(middleKnuckle, 0.52);
-      const gauntlet = this.gauntlets[index];
-      gauntlet.position.set(gloveCenter.x, gloveCenter.y, 11);
-      gauntlet.rotation.z = handAngle;
-      gauntlet.scale.set(handSpan * 0.52, wristToPalmLength * 0.52, 0.75);
-      palm.position.set(center.x, center.y, 12);
-      palm.scale.setScalar(Math.max(handSpan * 0.27, 8) * options.intensity);
-      palm.rotation.z = time * 0.0005;
-      handHud.position.set(center.x, center.y, 10);
-      handHud.rotation.z = handAngle;
-      handHud.scale.setScalar(Math.max(handSpan * 0.9, 12));
+    // ── Pelvis Belt, Codpiece & Hip Sockets (seamless bridge from abs to thighs) ──
+    const showPelvis = hipConf > 0.28 || hipMid.y > -bodyScale * 0.45;
+    rig.pelvis.visible = showPelvis;
+    if (showPelvis) {
+      const pelvisW = Math.max(Math.hypot(hipL.x - hipR.x, hipL.y - hipR.y) * 1.58, bodyScale * 1.24);
+      rig.pelvis.position.set(
+        hipMid.x - ux * bodyScale * 0.04,
+        hipMid.y - uy * bodyScale * 0.04,
+        hipMid.z + 8,
+      );
+      rig.pelvis.rotation.set(torsoPitch * 0.6, torsoYaw * 0.85, torsoRoll);
+      rig.pelvis.scale.set(pelvisW, bodyScale * 0.72, bodyScale * 0.62);
+    }
 
-      if (options.effects && isOpen && !this.previousOpenHands[index]) {
-        this.lastShotAt[index] = time;
-        this.suitUpStartedAt = time;
-      }
-      this.previousOpenHands[index] = isOpen;
+    // ── 3D Helmet & Neck Tracking (478 Face Mesh + rigid matrix + Pose fallback) ──
+    const headBase = this.updateHelmet(pose, face, faceMatrix, cover, bodyScale, torsoYaw, torsoRoll, ux, uy, shMid);
+    const neckStart: ScreenPt = {
+      x: shMid.x + ux * bodyScale * 0.02,
+      y: shMid.y + uy * bodyScale * 0.02,
+      z: shMid.z + 6,
+      vis: 1,
+    };
+    if (headBase) {
+      this.placeLimb(rig.neck, neckStart, headBase, bodyScale * 0.68, 4, 0.72, 1.32);
+    } else {
+      rig.neck.visible = false;
+    }
 
-      const beam = this.repulsorBolts[index];
-      if (beam.visible) {
-        const progress = (time - this.lastShotAt[index]) / 280;
-        const direction = indexTip.sub(wrist);
-        const angle =
-          direction.lengthSq() > 0.0001
-            ? Math.atan2(direction.y, direction.x) - Math.PI / 2
-            : Math.PI;
-        beam.position.set(center.x, center.y, 14);
-        beam.rotation.z = angle;
-        beam.scale.setScalar(Math.max(handSpan * 0.21, 7) * options.intensity);
-        beam.scale.y = Math.max(this.height, this.width) * (0.25 + progress * 0.22);
-        beam.scale.x = Math.max(handSpan * 0.2, 5) * options.intensity * (1 - progress * 0.42);
-      }
-    });
+    // ── Layered Mark LXXXV Shoulder Pauldrons, Gold Biceps, Elbows & Crimson Forearms ──
+    const armConfigs = [
+      {
+        side: 1, // person's left -> screen right
+        sh: shL,
+        elIdx: 13,
+        wrIdx: 15,
+        pauldron: rig.pauldronL,
+        upper: rig.upperArmL,
+        elbow: rig.elbowL,
+        fore: rig.forearmL,
+      },
+      {
+        side: -1, // person's right -> screen left
+        sh: shR,
+        elIdx: 14,
+        wrIdx: 16,
+        pauldron: rig.pauldronR,
+        upper: rig.upperArmR,
+        elbow: rig.elbowR,
+        fore: rig.forearmR,
+      },
+    ] as const;
 
-    const deploymentActive =
-      this.suitUpStartedAt >= 0 && time - this.suitUpStartedAt < this.suitUpDuration * 0.9;
-    this.nanites.visible = options.armor && options.effects && deploymentActive;
-    for (let index = 0; index < this.nanites.count; index += 1) {
-      const target = this.naniteTargets[index % this.naniteTargets.length];
-      const progress = target.active
-        ? (time - this.suitUpStartedAt - target.delay * this.suitUpDuration) / (this.suitUpDuration * 0.23)
-        : -1;
-      if (progress < 0 || progress > 1 || !this.nanites.visible) {
-        this.naniteDummy.scale.setScalar(0);
+    const trackedWrists: [ScreenPt | null, ScreenPt | null] = [null, null];
+
+    for (let ai = 0; ai < armConfigs.length; ai++) {
+      const a = armConfigs[ai];
+      const elRaw = pose[a.elIdx];
+      const wrRaw = pose[a.wrIdx];
+      const elOk = elRaw && (elRaw.visibility ?? 0) > 0.25;
+      const wrOk = wrRaw && (wrRaw.visibility ?? 0) > 0.25;
+
+      const el = elOk ? this.proj(elRaw, cover, bodyScale) : null;
+      const wr = wrOk ? this.proj(wrRaw, cover, bodyScale) : null;
+      trackedWrists[ai] = wr;
+
+      // Shoulder pauldron wraps outer deltoid and fuses seamlessly into chest cuirass
+      a.pauldron.visible = true;
+      const pRoll = el
+        ? Math.atan2(a.sh.y - el.y, a.sh.x - el.x) - Math.PI * 0.5
+        : torsoRoll - a.side * 0.22;
+      a.pauldron.position.set(
+        a.sh.x + a.side * rx * bodyScale * 0.08 + ux * bodyScale * 0.03,
+        a.sh.y + a.side * ry * bodyScale * 0.08 + uy * bodyScale * 0.03,
+        a.sh.z + 24,
+      );
+      a.pauldron.rotation.set(0, torsoYaw * 0.55, pRoll);
+      a.pauldron.scale.set(bodyScale * 0.68, bodyScale * 0.64, bodyScale * 0.58);
+
+      if (el) {
+        this.placeLimb(a.upper, el, a.sh, bodyScale * 0.58, 15, 0.76, 1.15);
       } else {
-        const travel = easeOut(progress);
-        const fan = Math.sin(progress * Math.PI) * (4 + (index % 7) * 1.3);
-        const angle = index * 2.399 + progress * 7;
-        this.naniteDummy.position.set(
-          this.naniteOrigin.x + (target.point.x - this.naniteOrigin.x) * travel + Math.cos(angle) * fan,
-          this.naniteOrigin.y + (target.point.y - this.naniteOrigin.y) * travel + Math.sin(angle) * fan,
-          16 + Math.sin(angle * 2) * 0.8,
-        );
-        this.naniteDummy.rotation.set(angle, angle * 0.7, angle * 1.4);
-        this.naniteDummy.scale.setScalar(7 + Math.sin(progress * Math.PI) * 8);
+        a.upper.visible = false;
       }
-      this.naniteDummy.updateMatrix();
-      this.nanites.setMatrixAt(index, this.naniteDummy.matrix);
+
+      if (el && wr) {
+        this.placeLimb(a.fore, wr, el, bodyScale * 0.53, 28, 0.76, 1.14);
+        const fRoll = Math.atan2(el.y - wr.y, el.x - wr.x) - Math.PI * 0.5;
+        a.elbow.visible = true;
+        a.elbow.position.set(el.x, el.y, el.z + 32);
+        a.elbow.rotation.set(0, 0, fRoll);
+        a.elbow.scale.setScalar(bodyScale * 0.34);
+      } else {
+        a.fore.visible = false;
+        a.elbow.visible = false;
+      }
     }
-    this.nanites.instanceMatrix.needsUpdate = true;
-    this.composer.render();
+
+    // ── Full-Body Mark LXXXV Legs: Hip Sockets, Thighs, Knee Cops, Shin Greaves & Armored Boots ──
+    const legConfigs = [
+      {
+        hip: hipL,
+        knIdx: 25,
+        anIdx: 27,
+        ftIdx: 31,
+        hipSocket: rig.hipL,
+        thigh: rig.thighL,
+        knee: rig.kneeL,
+        shin: rig.shinL,
+        boot: rig.bootL,
+      },
+      {
+        hip: hipR,
+        knIdx: 26,
+        anIdx: 28,
+        ftIdx: 32,
+        hipSocket: rig.hipR,
+        thigh: rig.thighR,
+        knee: rig.kneeR,
+        shin: rig.shinR,
+        boot: rig.bootR,
+      },
+    ] as const;
+
+    for (const l of legConfigs) {
+      const knRaw = pose[l.knIdx];
+      const anRaw = pose[l.anIdx];
+      const ftRaw = pose[l.ftIdx];
+      const kn = knRaw && (knRaw.visibility ?? 0) > 0.28 ? this.proj(knRaw, cover, bodyScale) : null;
+      const an = anRaw && (anRaw.visibility ?? 0) > 0.28 ? this.proj(anRaw, cover, bodyScale) : null;
+      const ft = ftRaw && (ftRaw.visibility ?? 0) > 0.28 ? this.proj(ftRaw, cover, bodyScale) : null;
+
+      if (kn && l.hip.vis > 0.28) {
+        l.hipSocket.visible = true;
+        l.hipSocket.position.set(l.hip.x, l.hip.y, l.hip.z + 4);
+        l.hipSocket.scale.setScalar(bodyScale * 0.44);
+        this.placeLimb(l.thigh, kn, l.hip, bodyScale * 0.68, 6, 0.74, 1.15);
+      } else {
+        l.hipSocket.visible = false;
+        l.thigh.visible = false;
+      }
+
+      if (kn && an) {
+        this.placeLimb(l.shin, an, kn, bodyScale * 0.58, 10, 0.74, 1.14);
+        const sRoll = Math.atan2(kn.y - an.y, kn.x - an.x) - Math.PI * 0.5;
+        l.knee.visible = true;
+        l.knee.position.set(kn.x, kn.y, kn.z + 18);
+        l.knee.rotation.set(0, 0, sRoll);
+        l.knee.scale.setScalar(bodyScale * 0.39);
+
+        if (ft) {
+          this.placeLimb(l.boot, ft, an, bodyScale * 0.48, 14, 0.82, 1.24);
+        } else {
+          // Grounded ankle-boot cap even when toes clip bottom of screen
+          const bootTip: ScreenPt = { x: an.x, y: an.y - bodyScale * 0.28, z: an.z + 8, vis: 1 };
+          this.placeLimb(l.boot, bootTip, an, bodyScale * 0.46, 14, 0.8, 1.1);
+        }
+      } else {
+        l.shin.visible = false;
+        l.knee.visible = false;
+        l.boot.visible = false;
+      }
+    }
+
+    // ── Articulated 3D Gauntlets, 30 Fingers, Palm Repulsors & Fallback Wrist Gauntlets ──
+    const palmCenters: ScreenPt[] = [];
+    this.updateHands(hands, openHands, trackedWrists, pose, cover, bodyScale, dt, palmCenters);
+
+    // ── Tactile Chest Arc Reactor Double-Tap / Hold Trigger (like Tony Stark in Infinity War!) ──
+    const touchSources = [
+      ...palmCenters,
+      ...(trackedWrists.filter((w): w is ScreenPt => w !== null)),
+    ];
+    let nearReactor = false;
+    const hitRadius = bodyScale * 0.42;
+    for (const p of touchSources) {
+      if (Math.hypot(p.x - reactorWorld.x, p.y - reactorWorld.y) < hitRadius) {
+        nearReactor = true;
+        break;
+      }
+    }
+
+    if (nearReactor && now >= this.chestCooldownUntil && this.suitPhase !== 'equipping' && this.suitPhase !== 'retracting') {
+      this.chestHold = Math.min(1, this.chestHold + dt / CHEST_HOLD_SEC);
+      rig.reactor.touchRing.visible = true;
+      rig.reactor.touchRing.scale.setScalar(0.9 + this.chestHold * 0.72);
+      rig.reactor.touchRingMat.opacity = 0.25 + this.chestHold * 0.7;
+      if (this.chestHold >= 1) {
+        this.chestHold = 0;
+        this.chestCooldownUntil = now + CHEST_COOLDOWN_MS;
+        rig.reactor.touchRing.visible = false;
+        this.toggleSuit();
+      }
+    } else {
+      this.chestHold = Math.max(0, this.chestHold - dt * 3.0);
+      rig.reactor.touchRing.visible = this.chestHold > 0.04;
+      rig.reactor.touchRingMat.opacity = this.chestHold * 0.55;
+    }
   }
 
-  prepareCapture() {
-    this.composer.render();
+  private updateHelmet(
+    pose: Landmark[],
+    face: Landmark[],
+    faceMatrix: number[] | null,
+    cover: CoverTransform,
+    bodyScale: number,
+    torsoYaw: number,
+    torsoRoll: number,
+    ux: number,
+    uy: number,
+    shMid: ScreenPt,
+  ): ScreenPt | null {
+    const rig = this.rig;
+    const mats = this.mats;
+    if (!rig || !mats) return null;
+
+    // Case 1: High-precision 478 Face Landmarks + optional rigid 4x4 facialTransformationMatrix
+    if (face.length >= 455) {
+      const forehead = this.proj(face[10], cover, bodyScale);
+      const chin = this.proj(face[152], cover, bodyScale);
+      const cheekA = this.proj(face[234], cover, bodyScale);
+      const cheekB = this.proj(face[454], cover, bodyScale);
+      const brow = this.proj(face[168], cover, bodyScale);
+      const nose = this.proj(face[1], cover, bodyScale);
+
+      const cheekSpan = Math.hypot(cheekA.x - cheekB.x, cheekA.y - cheekB.y);
+      const faceSpanY = Math.hypot(forehead.x - chin.x, forehead.y - chin.y);
+
+      if (cheekSpan > 14 && faceSpanY > 16) {
+        let roll = Math.atan2(forehead.y - chin.y, forehead.x - chin.x) - Math.PI * 0.5;
+        const cheekMidX = (cheekA.x + cheekB.x) * 0.5;
+        let yaw = THREE.MathUtils.clamp(((nose.x - cheekMidX) / Math.max(cheekSpan * 0.5, 1)) * 0.72, -0.72, 0.72);
+        let pitch = THREE.MathUtils.clamp(
+          -((brow.y - (forehead.y + chin.y) * 0.5) / Math.max(faceSpanY, 1) - 0.08) * 1.1,
+          -0.44,
+          0.44,
+        );
+
+        // Blend with MediaPipe's rigid 3D facial transformation matrix for rock-steady 3D head orientation
+        if (faceMatrix && faceMatrix.length === 16) {
+          const m = new THREE.Matrix4().fromArray(faceMatrix);
+          const e = new THREE.Euler().setFromRotationMatrix(m, 'YXZ');
+          if (Number.isFinite(e.x) && Number.isFinite(e.y)) {
+            yaw = THREE.MathUtils.lerp(yaw, THREE.MathUtils.clamp(-e.y * 0.82, -0.78, 0.78), 0.5);
+            pitch = THREE.MathUtils.lerp(pitch, THREE.MathUtils.clamp(e.x * 0.72, -0.46, 0.46), 0.45);
+          }
+        }
+
+        // Un-foreshorten helmet width so it wraps the ENTIRE skull, hair, cheeks & jaw with zero skin poking out!
+        const trueFaceW = cheekSpan / Math.max(Math.cos(yaw), 0.64);
+        const helmW = Math.max(trueFaceW * 1.24, bodyScale * 0.68);
+        const helmH = Math.max(faceSpanY * 1.28, helmW * 1.12);
+        const helmD = helmW * 0.92;
+
+        // Center helmet so glowing Iron Man eye lenses align directly with the user's real eyes!
+        const upX = -Math.sin(roll);
+        const upY = Math.cos(roll);
+        const cx = (cheekMidX + brow.x) * 0.5 + upX * helmH * 0.025;
+        const cy = (forehead.y + chin.y) * 0.5 + upY * helmH * 0.035;
+        const cz = (nose.z + cheekA.z + cheekB.z) / 3 + 38;
+
+        rig.helmet.group.visible = true;
+        rig.helmet.group.position.set(cx, cy, cz);
+        rig.helmet.group.rotation.set(pitch, yaw, roll);
+        rig.helmet.group.scale.set(helmW, helmH, helmD);
+
+        mats.uniforms.uVisorOrigin.value.set(cx, cy, cz + 25);
+        mats.uniforms.uFaceScale.value = helmW * 0.62;
+
+        return {
+          x: chin.x - upX * helmH * 0.03,
+          y: chin.y - upY * helmH * 0.03,
+          z: cz - 14,
+          vis: 1,
+        };
+      }
+    }
+
+    // Case 2: Seamless Pose-Landmark Helmet Fallback (when standing far back for full-body shot or sharp head turn!)
+    const noseLm = pose[0];
+    const earL = pose[7];
+    const earR = pose[8];
+    if (noseLm && (noseLm.visibility ?? 0) > 0.35) {
+      const nose = this.proj(noseLm, cover, bodyScale);
+      let cx = nose.x;
+      let cy = nose.y + bodyScale * 0.07;
+      let roll = torsoRoll;
+      let helmW = bodyScale * 0.72;
+
+      if (earL && earR && (earL.visibility ?? 0) > 0.3 && (earR.visibility ?? 0) > 0.3) {
+        const pEL = this.proj(earL, cover, bodyScale);
+        const pER = this.proj(earR, cover, bodyScale);
+        const earSpan = Math.hypot(pEL.x - pER.x, pEL.y - pER.y);
+        cx = (pEL.x + pER.x + nose.x) / 3;
+        cy = (pEL.y + pER.y) * 0.5 + bodyScale * 0.06;
+        roll = Math.atan2(pEL.y - pER.y, pEL.x - pER.x);
+        helmW = THREE.MathUtils.clamp(earSpan * 1.48, bodyScale * 0.66, bodyScale * 0.92);
+      }
+
+      const helmH = helmW * 1.18;
+      const cz = nose.z + 36;
+      rig.helmet.group.visible = true;
+      rig.helmet.group.position.set(cx, cy, cz);
+      rig.helmet.group.rotation.set(0, torsoYaw * 0.85, roll);
+      rig.helmet.group.scale.set(helmW, helmH, helmW * 0.9);
+
+      mats.uniforms.uVisorOrigin.value.set(cx, cy, cz + 25);
+      mats.uniforms.uFaceScale.value = helmW * 0.62;
+
+      return {
+        x: cx - ux * helmH * 0.42,
+        y: cy - uy * helmH * 0.42,
+        z: cz - 14,
+        vis: 1,
+      };
+    }
+
+    rig.helmet.group.visible = false;
+    return null;
   }
 
-  drawTracking(
-    canvas: HTMLCanvasElement,
-    options: OverlayOptions,
+  private updateHands(
+    hands: Landmark[][],
+    openHands: boolean[],
+    trackedWrists: [ScreenPt | null, ScreenPt | null],
+    pose: Landmark[],
+    cover: CoverTransform,
+    bodyScale: number,
+    dt: number,
+    palmCentersOut: ScreenPt[],
   ) {
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    if (canvas.width !== Math.round(width * pixelRatio) || canvas.height !== Math.round(height * pixelRatio)) {
-      canvas.width = Math.round(width * pixelRatio);
-      canvas.height = Math.round(height * pixelRatio);
+    const rig = this.rig;
+    const mats = this.mats;
+    if (!rig || !mats) return;
+
+    const usedWristIdx = new Set<number>();
+
+    for (let i = 0; i < 2; i++) {
+      const hRig = rig.hands[i];
+      const pLight = this.repulsorLights?.[i];
+      const hand = hands[i];
+
+      if (!hand || hand.length < 21) {
+        hRig.gauntlet.visible = false;
+        hRig.repulsor.visible = false;
+        hRig.blastGroup.visible = false;
+        hRig.fingers.forEach((f) => (f.visible = false));
+        hRig.shockRings.forEach((sr) => (sr.visible = false));
+        this.palmCharge[i] = Math.max(0, this.palmCharge[i] - dt * 5);
+        this.palmWasOpen[i] = false;
+        if (pLight) pLight.intensity = 0;
+        continue;
+      }
+
+      const pts = hand.map((lm) => this.proj(lm, cover, bodyScale));
+      const wrist = pts[0];
+      const idxMcp = pts[5];
+      const midMcp = pts[9];
+      const pnkMcp = pts[17];
+
+      // Mark closest pose wrist as already covered by full 21-point hand tracking
+      trackedWrists.forEach((tw, wi) => {
+        if (tw && Math.hypot(tw.x - wrist.x, tw.y - wrist.y) < bodyScale * 0.6) usedWristIdx.add(wi);
+      });
+
+      const palmW = Math.max(Math.hypot(idxMcp.x - pnkMcp.x, idxMcp.y - pnkMcp.y), bodyScale * 0.24);
+      const palmCx = (wrist.x + idxMcp.x + midMcp.x + pnkMcp.x) * 0.25;
+      const palmCy = (wrist.y + idxMcp.y + midMcp.y + pnkMcp.y) * 0.25;
+      const palmCz = wrist.z + 44;
+      palmCentersOut.push({ x: palmCx, y: palmCy, z: palmCz, vis: 1 });
+
+      // Gauntlet hand shell
+      this.placeLimb(hRig.gauntlet, wrist, midMcp, palmW * 1.24, 42, 0.65, 1.22);
+
+      // 15 articulated armored finger phalanges per hand!
+      const fingerW = palmW * 0.295;
+      let fi = 0;
+      for (let f = 0; f < FINGER_CHAINS.length; f++) {
+        const chain = FINGER_CHAINS[f];
+        for (let s = 0; s < chain.length; s++) {
+          const [aIdx, bIdx] = chain[s];
+          const wScale = f === 0 ? 1.12 : 1.0 - s * 0.08;
+          this.placeLimb(hRig.fingers[fi++], pts[aIdx], pts[bIdx], fingerW * wScale, 46 + s, 0.72, 1.18);
+        }
+      }
+
+      // Check local nanotech coverage at the palm so repulsors only fire once gauntlets have materialized!
+      const origin = mats.uniforms.uNanoOrigin.value;
+      const handDist = Math.hypot(palmCx - origin.x, palmCy - origin.y) / Math.max(bodyScale, 24);
+      const gauntletFormed = this.suitProgress > handDist + 0.12;
+
+      const isOpen = Boolean(openHands[i]) && gauntletFormed;
+      if (isOpen && !this.palmWasOpen[i]) {
+        soundFx.playRepulsorBlast();
+      }
+      this.palmWasOpen[i] = isOpen;
+
+      this.palmCharge[i] = isOpen
+        ? Math.min(1, this.palmCharge[i] + dt * 6.5)
+        : Math.max(0, this.palmCharge[i] - dt * 5.0);
+      const ch = this.palmCharge[i];
+
+      if (gauntletFormed && (isOpen || ch > 0.04)) {
+        const repR = palmW * (0.36 + ch * 0.16);
+        hRig.repulsor.visible = true;
+        hRig.repulsor.position.set(palmCx, palmCy, palmCz + 8);
+        hRig.repulsor.scale.setScalar(repR);
+        hRig.repulsorRing.rotation.z = -this.elapsed * (2.5 + ch * 5.5);
+        hRig.repulsorCoronaMat.opacity = 0.55 + ch * 0.42;
+
+        const flicker = 0.93 + 0.07 * Math.sin(this.elapsed * 32 + i * 2.1);
+        hRig.blastGroup.visible = true;
+        hRig.blastGroup.position.set(palmCx, palmCy, palmCz + 16);
+        hRig.blastGroup.scale.setScalar(palmW * (0.42 + ch * 0.68) * flicker);
+        hRig.blastGlowMat.opacity = ch * 0.85;
+        hRig.blastCoreMat.opacity = ch * 0.98;
+
+        for (let r = 0; r < hRig.shockRings.length; r++) {
+          const ph = (this.elapsed * 2.1 + r * 0.5 + i * 0.25) % 1;
+          const sr = hRig.shockRings[r];
+          sr.visible = true;
+          sr.position.set(palmCx, palmCy, palmCz + 18 + r);
+          sr.scale.setScalar(palmW * (0.34 + ph * 1.45));
+          hRig.shockMats[r].opacity = (1 - ph) * (1 - ph) * ch * 0.62;
+        }
+
+        if (pLight) {
+          pLight.position.set(palmCx, palmCy, palmCz + bodyScale * 0.45);
+          pLight.distance = bodyScale * 3.2;
+          pLight.intensity = ch * 3.4 * flicker;
+        }
+      } else {
+        hRig.repulsor.visible = false;
+        hRig.blastGroup.visible = false;
+        hRig.shockRings.forEach((sr) => (sr.visible = false));
+        if (pLight) pLight.intensity = 0;
+      }
     }
 
-    const context = canvas.getContext('2d');
-    if (!context) return;
-    context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-    context.clearRect(0, 0, width, height);
-
-    if (options.body && this.smoothedPose.length > 0) {
-      const bones: [number, number][] = [
-        [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
-        [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [24, 26], [26, 28],
-      ];
-      context.lineWidth = 1.5;
-      context.strokeStyle = 'rgba(107, 218, 255, 0.72)';
-      bones.forEach(([start, end]) => {
-        if (!visible(this.smoothedPose[start]) || !visible(this.smoothedPose[end])) return;
-        context.beginPath();
-        const startPoint = this.mapPoint(this.smoothedPose[start]);
-        const endPoint = this.mapPoint(this.smoothedPose[end]);
-        context.moveTo(startPoint.x, startPoint.y);
-        context.lineTo(endPoint.x, endPoint.y);
-        context.stroke();
-      });
-      [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28].forEach((index) => {
-        const landmark = this.smoothedPose[index];
-        if (!visible(landmark)) return;
-        const position = this.mapPoint(landmark);
-        context.beginPath();
-        context.fillStyle = '#baf5ff';
-        context.arc(position.x, position.y, 2.5, 0, Math.PI * 2);
-        context.fill();
-      });
+    // Pose-hand fallback gauntlets: even when hands are down by your hips in a full-body shot and HandLandmarker
+    // hasn't picked up individual fingers yet, your hands STILL wear complete 3D crimson-and-gold Mark 85 gauntlets!
+    const poseHands: [number, number][] = [
+      [15, 19], // left wrist -> left index
+      [16, 20], // right wrist -> right index
+    ];
+    let freeSlot = hands.length;
+    for (let pi = 0; pi < poseHands.length && freeSlot < 2; pi++) {
+      if (usedWristIdx.has(pi)) continue;
+      const [wIdx, idxIdx] = poseHands[pi];
+      const wLm = pose[wIdx];
+      const iLm = pose[idxIdx];
+      if (wLm && iLm && (wLm.visibility ?? 0) > 0.3 && (iLm.visibility ?? 0) > 0.28) {
+        const pw = this.proj(wLm, cover, bodyScale);
+        const piPt = this.proj(iLm, cover, bodyScale);
+        const hRig = rig.hands[freeSlot++];
+        this.placeLimb(hRig.gauntlet, pw, piPt, bodyScale * 0.38, 36, 0.7, 1.45);
+      }
     }
+  }
 
-    if (options.face && this.smoothedFace.length > 0) {
-      context.beginPath();
-      context.strokeStyle = 'rgba(255, 207, 123, 0.72)';
-      context.lineWidth = 1.2;
-      [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109, 10].forEach(
-        (index, pointIndex) => {
-          const landmark = this.smoothedFace[index];
-          if (!landmark) return;
-          const position = this.mapPoint(landmark);
-          const x = position.x;
-          const y = position.y;
-          if (pointIndex === 0) context.moveTo(x, y);
-          else context.lineTo(x, y);
-        },
-      );
-      context.stroke();
-      [33, 263].forEach((index) => {
-        const eye = this.smoothedFace[index];
-        if (!eye) return;
-        const position = this.mapPoint(eye);
-        context.beginPath();
-        context.strokeStyle = 'rgba(103, 230, 255, 0.7)';
-        context.arc(position.x, position.y, 10, 0, Math.PI * 2);
-        context.stroke();
-      });
-    }
+  private renderFrame() {
+    const renderer = this.renderer;
+    const scene = this.scene;
+    const camera = this.camera;
+    const post = this.post;
+    if (!renderer || !scene || !camera || !post) return;
 
-    if (options.hands) {
-      this.smoothedHands.forEach((hand) => {
-        hand.forEach((landmark, index) => {
-          if (index % 4 !== 0 && index !== 8 && index !== 12 && index !== 16 && index !== 20) return;
-          const position = this.mapPoint(landmark);
-          context.beginPath();
-          context.fillStyle = index === 0 ? '#80eaff' : 'rgba(179, 242, 255, 0.8)';
-          context.arc(position.x, position.y, index === 0 ? 3 : 2, 0, Math.PI * 2);
-          context.fill();
-        });
-      });
-    }
+    renderer.setRenderTarget(post.sceneRT);
+    renderer.clear(true, true, false);
+    renderer.render(scene, camera);
+
+    post.quad.material = post.brightMat;
+    post.brightMat.uniforms.tInput.value = post.sceneRT.texture;
+    renderer.setRenderTarget(post.brightRT);
+    renderer.render(post.postScene, post.postCam);
+
+    const bw = post.blurART.width;
+    const bh = post.blurART.height;
+    post.quad.material = post.blurMat;
+
+    post.blurMat.uniforms.tInput.value = post.brightRT.texture;
+    post.blurMat.uniforms.uStep.value.set(1 / bw, 0);
+    renderer.setRenderTarget(post.blurART);
+    renderer.render(post.postScene, post.postCam);
+
+    post.blurMat.uniforms.tInput.value = post.blurART.texture;
+    post.blurMat.uniforms.uStep.value.set(0, 1 / bh);
+    renderer.setRenderTarget(post.blurBRT);
+    renderer.render(post.postScene, post.postCam);
+
+    post.blurMat.uniforms.tInput.value = post.blurBRT.texture;
+    post.blurMat.uniforms.uStep.value.set(1.8 / bw, 0);
+    renderer.setRenderTarget(post.blurART);
+    renderer.render(post.postScene, post.postCam);
+
+    post.blurMat.uniforms.tInput.value = post.blurART.texture;
+    post.blurMat.uniforms.uStep.value.set(0, 1.8 / bh);
+    renderer.setRenderTarget(post.blurBRT);
+    renderer.render(post.postScene, post.postCam);
+
+    post.quad.material = post.compositeMat;
+    renderer.setRenderTarget(null);
+    renderer.clear(true, false, false);
+    renderer.render(post.postScene, post.postCam);
+  }
+
+  private emitTelemetry(force: boolean) {
+    if (!this.onTelemetry) return;
+    const now = performance.now();
+    if (!force && now - this.lastTelemPush < 160) return;
+    this.lastTelemPush = now;
+    const bodyDetected = now - this.lastBodySeenAt <= BODY_GRACE_MS && this.cachedPose.length >= 25;
+    this.onTelemetry({
+      phase: this.suitPhase,
+      visorOpen: this.visorOpen,
+      bodyDetected,
+      repulsorActive: this.palmCharge[0] > 0.25 || this.palmCharge[1] > 0.25,
+    });
   }
 
   dispose() {
-    this.composer.dispose();
-    this.bloomPass.dispose();
-    this.cinematicPass.material.dispose();
-    this.cinematicPass.fsQuad.dispose();
-
-    const geometries = new Set<THREE.BufferGeometry>();
-    const materials = new Set<THREE.Material>();
-    const disposeSceneResources = (scene: THREE.Scene) => {
-      scene.traverse((object) => {
-        if (!(object instanceof THREE.Mesh) && !(object instanceof THREE.Line)) return;
-        geometries.add(object.geometry);
-        const objectMaterials = Array.isArray(object.material) ? object.material : [object.material];
-        objectMaterials.forEach((material) => materials.add(material));
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    if (this.rig) {
+      this.rig.root.traverse((obj) => {
+        if (obj instanceof THREE.Mesh && obj.geometry !== this.rig?.fingerGeo) {
+          obj.geometry.dispose();
+        }
       });
-    };
-    disposeSceneResources(this.scene);
-    geometries.forEach((geometry) => geometry.dispose());
-    materials.forEach((material) => material.dispose());
-    this.hudTexture.dispose();
-    this.environmentMap.dispose();
-    this.renderer.dispose();
-    this.renderer.domElement.remove();
+      this.rig.fingerGeo.dispose();
+      this.rig.reactor.glowTexture.dispose();
+      this.rig.reactor.coronaMat.dispose();
+      this.rig.reactor.shockwaveMat.dispose();
+      this.rig.reactor.touchRingMat.dispose();
+      this.rig.hands.forEach((h) => {
+        h.repulsorCoronaMat.dispose();
+        h.blastCoreMat.dispose();
+        h.blastGlowMat.dispose();
+        h.shockMats.forEach((m) => m.dispose());
+      });
+      this.rig = null;
+    }
+    this.mats?.dispose();
+    this.mats = null;
+    this.post?.dispose();
+    this.post = null;
+    this.envTex?.dispose();
+    this.envTex = null;
+    this.renderer?.dispose();
+    this.renderer = null;
+    this.scene = null;
+    this.camera = null;
   }
 }
