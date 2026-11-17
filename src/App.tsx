@@ -1,463 +1,394 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Activity,
-  Aperture,
   Camera,
   Check,
-  ChevronDown,
-  CircleHelp,
-  Download,
-  Expand,
+  Copy,
+  ExternalLink,
   Eye,
-  Gauge,
-  Hand,
-  Layers3,
+  EyeOff,
   Maximize2,
-  Pause,
-  Play,
+  Minimize2,
+  RefreshCw,
   RotateCcw,
-  ScanFace,
-  Settings2,
   Shield,
-  Sparkles,
-  Video,
-  X,
-  Zap,
+  ShieldOff,
+  SwitchCamera,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
-import type { ArmorOverlay, OverlayOptions } from './ArmorOverlay';
+import { ArmorOverlayController } from './ArmorOverlay';
+import { soundFx } from './soundEffects';
+import type { SuitTelemetry } from './trackingTypes';
 import { useArmorTracking } from './useArmorTracking';
 
-const INITIAL_OPTIONS: OverlayOptions = {
-  armor: true,
-  face: true,
-  body: true,
-  hands: true,
-  effects: true,
-  intensity: 1,
+const INITIAL_TELEMETRY: SuitTelemetry = {
+  phase: 'searching',
+  visorOpen: false,
+  bodyDetected: false,
+  repulsorActive: false,
 };
 
-function App() {
-  const { videoRef, frame, latestFrameRef, status, error, cpuMode, startCamera, stopCamera } = useArmorTracking();
-  const [options, setOptions] = useState(INITIAL_OPTIONS);
-  const [paused, setPaused] = useState(false);
-  const [rendererError, setRendererError] = useState('');
-  const [cameraSize, setCameraSize] = useState({ width: 0, height: 0 });
-  const [renderFps, setRenderFps] = useState(0);
-  const overlayHostRef = useRef<HTMLDivElement>(null);
-  const trackingCanvasRef = useRef<HTMLCanvasElement>(null);
-  const overlayRef = useRef<ArmorOverlay | null>(null);
-  const optionsRef = useRef(options);
-  const statusRef = useRef(status);
-  const pausedRef = useRef(paused);
+function detectEmbeddedFrame(): boolean {
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
 
-  useEffect(() => {
-    optionsRef.current = options;
-  }, [options]);
+export default function App() {
+  const {
+    videoRef,
+    latestFrameRef,
+    status,
+    trackerReady,
+    trackerError,
+    errorKind,
+    errorMessage,
+    cameras,
+    startCamera,
+    cycleCamera,
+  } = useArmorTracking();
 
+  const stageRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const controllerRef = useRef<ArmorOverlayController | null>(null);
+  const idleTimerRef = useRef<number | null>(null);
+
+  const [telemetry, setTelemetry] = useState<SuitTelemetry>(INITIAL_TELEMETRY);
+  const [soundOn, setSoundOn] = useState(true);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [controlsAwake, setControlsAwake] = useState(true);
+  const [pageUrl, setPageUrl] = useState('');
+  const [inIframe, setInIframe] = useState(false);
+  const [showStartActions, setShowStartActions] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [webglError, setWebglError] = useState('');
+
+  // StrictMode-safe single auto-start of the PC webcam on load
   useEffect(() => {
-    statusRef.current = status;
+    setPageUrl(window.location.href);
+    setInIframe(detectEmbeddedFrame());
+    const timer = window.setTimeout(() => {
+      void startCamera();
+    }, 50);
+    return () => window.clearTimeout(timer);
+  }, [startCamera]);
+
+  // Show manual action buttons if the browser holds the camera prompt open > 2s
+  useEffect(() => {
+    if (status !== 'starting') {
+      setShowStartActions(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setShowStartActions(true), 2000);
+    return () => window.clearTimeout(timer);
   }, [status]);
 
+  // Mount fullscreen 3D Iron Man Mark 85 armor & nanotech renderer safely
   useEffect(() => {
-    pausedRef.current = paused;
-  }, [paused]);
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let ctrl: ArmorOverlayController | null = null;
+    try {
+      ctrl = new ArmorOverlayController({
+        canvas,
+        getVideo: () => videoRef.current,
+        getFrame: () => latestFrameRef.current,
+        onTelemetry: setTelemetry,
+      });
+      controllerRef.current = ctrl;
+      setWebglError('');
+    } catch (err) {
+      setWebglError(
+        err instanceof Error
+          ? `WebGL indisponible : ${err.message}`
+          : 'Impossible d’initialiser le rendu 3D WebGL.',
+      );
+    }
+    return () => {
+      ctrl?.dispose();
+      controllerRef.current = null;
+    };
+  }, [latestFrameRef, videoRef]);
+
+  const wakeControls = useCallback(() => {
+    setControlsAwake(true);
+    if (idleTimerRef.current !== null) window.clearTimeout(idleTimerRef.current);
+    idleTimerRef.current = window.setTimeout(() => setControlsAwake(false), 3200);
+  }, []);
 
   useEffect(() => {
-    if (status !== 'ready') return;
-    const video = videoRef.current;
-    if (!video) return;
-
-    const updateSize = () => setCameraSize({ width: video.videoWidth, height: video.videoHeight });
-    updateSize();
-    video.addEventListener('loadedmetadata', updateSize);
-    return () => video.removeEventListener('loadedmetadata', updateSize);
-  }, [status, videoRef]);
+    wakeControls();
+    return () => {
+      if (idleTimerRef.current !== null) window.clearTimeout(idleTimerRef.current);
+    };
+  }, [wakeControls]);
 
   useEffect(() => {
-    if (status !== 'ready') return;
+    const onFs = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener('fullscreenchange', onFs);
+    return () => document.removeEventListener('fullscreenchange', onFs);
+  }, []);
 
-    const host = overlayHostRef.current;
-    if (!host) return;
+  const handleCopyUrl = useCallback(() => {
+    if (!pageUrl || !navigator.clipboard?.writeText) return;
+    void navigator.clipboard
+      .writeText(pageUrl)
+      .then(() => {
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 2200);
+      })
+      .catch(() => {});
+  }, [pageUrl]);
 
-    let overlay: ArmorOverlay | null = null;
-    let animationFrame = 0;
-    let disposed = false;
-    let renderFrames = 0;
-    let renderFpsStartedAt = 0;
-    let observer: ResizeObserver | null = null;
-    let resize = () => {};
+  const handleReplay = useCallback(() => {
+    wakeControls();
+    controllerRef.current?.replaySuitUp();
+  }, [wakeControls]);
 
-    const initialize = async () => {
-      try {
-        const { ArmorOverlay } = await import('./ArmorOverlay');
-        if (disposed) return;
+  const handleToggleSuit = useCallback(() => {
+    wakeControls();
+    controllerRef.current?.toggleSuit();
+  }, [wakeControls]);
 
-        overlay = new ArmorOverlay();
-        overlayRef.current = overlay;
-        host.appendChild(overlay.renderer.domElement);
+  const handleToggleVisor = useCallback(() => {
+    wakeControls();
+    controllerRef.current?.toggleVisor();
+  }, [wakeControls]);
 
-        const video = videoRef.current;
-        resize = () =>
-          overlay?.resize(
-            host.clientWidth,
-            host.clientHeight,
-            video?.videoWidth || 1,
-            video?.videoHeight || 1,
-          );
-        observer = new ResizeObserver(resize);
-        observer.observe(host);
-        video?.addEventListener('loadedmetadata', resize);
-        resize();
+  const handleToggleSound = useCallback(() => {
+    wakeControls();
+    const next = !soundOn;
+    setSoundOn(next);
+    soundFx.setEnabled(next);
+  }, [soundOn, wakeControls]);
 
-        const render = (time: number) => {
-          if (statusRef.current === 'ready' && !pausedRef.current) {
-            if (renderFpsStartedAt === 0) renderFpsStartedAt = time;
-            renderFrames += 1;
-            const renderElapsed = time - renderFpsStartedAt;
-            if (renderElapsed >= 1000) {
-              setRenderFps(Math.round((renderFrames * 1000) / renderElapsed));
-              renderFrames = 0;
-              renderFpsStartedAt = time;
-            }
-            const currentFrame = latestFrameRef.current;
-            const currentOptions = optionsRef.current;
-            overlay?.update(
-              currentFrame.pose,
-              currentFrame.face,
-              currentFrame.hands,
-              currentFrame.openHands,
-              currentOptions,
-              time,
-            );
-            if (trackingCanvasRef.current) {
-              overlay?.drawTracking(
-                trackingCanvasRef.current,
-                currentOptions,
-              );
-            }
-          }
-          animationFrame = requestAnimationFrame(render);
-        };
-        animationFrame = requestAnimationFrame(render);
-      } catch (reason) {
-        setRendererError(
-          reason instanceof Error
-            ? `Le rendu WebGL est indisponible : ${reason.message}`
-            : 'Le rendu WebGL est indisponible. Activez l’accélération graphique de votre navigateur.',
-        );
+  const handleFullscreen = useCallback(() => {
+    wakeControls();
+    const el = stageRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => {});
+    } else {
+      void el.requestFullscreen().catch(() => {});
+    }
+  }, [wakeControls]);
+
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      if (status !== 'ready') return;
+      const k = ev.key.toLowerCase();
+      if (k === 'r' || ev.code === 'Space') {
+        ev.preventDefault();
+        handleReplay();
+      } else if (k === 'e') {
+        handleToggleSuit();
+      } else if (k === 'v') {
+        handleToggleVisor();
+      } else if (k === 'f') {
+        handleFullscreen();
+      } else if (k === 'm') {
+        handleToggleSound();
       }
     };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [handleFullscreen, handleReplay, handleToggleSound, handleToggleSuit, handleToggleVisor, status]);
 
-    void initialize();
-
-    return () => {
-      disposed = true;
-      cancelAnimationFrame(animationFrame);
-      observer?.disconnect();
-      videoRef.current?.removeEventListener('loadedmetadata', resize);
-      overlay?.dispose();
-      overlayRef.current = null;
-    };
-  }, [status]);
-
-  const detections = useMemo(
-    () => [
-      { label: 'Visage', count: frame.face.length > 0 ? '478' : '—', active: frame.face.length > 0, icon: ScanFace },
-      { label: 'Corps', count: frame.pose.length > 0 ? '33' : '—', active: frame.pose.length > 0, icon: Activity },
-      {
-        label: 'Mains',
-        count: frame.hands.length > 0 ? `${frame.hands.length} / 2` : '—',
-        active: frame.hands.length > 0,
-        icon: Hand,
-      },
-    ],
-    [frame.face.length, frame.hands.length, frame.pose.length],
-  );
-
-  const toggleOption = (key: keyof Omit<OverlayOptions, 'intensity'>) => {
-    setOptions((current) => ({ ...current, [key]: !current[key] }));
-  };
-
-  const captureFrame = () => {
-    const video = videoRef.current;
-    const overlayCanvas = overlayHostRef.current?.querySelector('canvas');
-    const trackingCanvas = trackingCanvasRef.current;
-    if (!video || !overlayCanvas || video.readyState < 2) return;
-
-    overlayRef.current?.prepareCapture();
-    const output = document.createElement('canvas');
-    output.width = video.videoWidth;
-    output.height = video.videoHeight;
-    const context = output.getContext('2d');
-    if (!context) return;
-
-    context.save();
-    context.translate(output.width, 0);
-    context.scale(-1, 1);
-    context.drawImage(video, 0, 0, output.width, output.height);
-    context.drawImage(overlayCanvas, 0, 0, output.width, output.height);
-    if (trackingCanvas) context.drawImage(trackingCanvas, 0, 0, output.width, output.height);
-    context.restore();
-
-    const link = document.createElement('a');
-    link.download = `armor-lab-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
-    link.href = output.toDataURL('image/png');
-    link.click();
-  };
-
-  const toggleFullscreen = async () => {
-    const stage = document.querySelector('.camera-stage');
-    if (!stage) return;
-    try {
-      if (document.fullscreenElement) await document.exitFullscreen();
-      else await stage.requestFullscreen();
-    } catch {
-      setRendererError('Le mode plein écran n’a pas pu démarrer dans ce navigateur.');
-    }
-  };
-
-  const detectionCount = Number(frame.face.length > 0) + Number(frame.pose.length > 0) + frame.hands.length;
-  const trackingReady = status === 'ready' && detectionCount > 0;
-  const repulsorReady = frame.openHands.some(Boolean);
+  const suitActive = telemetry.phase === 'equipped' || telemetry.phase === 'equipping';
+  const statusBanner = webglError || trackerError;
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <a className="brand" href="#" aria-label="Armor Lab accueil">
-          <div className="brand-mark"><Aperture size={19} strokeWidth={1.8} /></div>
-          <span className="brand-name">ARMOR<span>LAB</span></span>
-          <span className="brand-divider" />
-          <span className="workspace-label">VFX STUDIO <span className="workspace-dot" /></span>
-        </a>
-        <div className="topbar-center">
-          <div className={`session-status ${status === 'ready' ? 'is-live' : ''}`}>
-            <span className="status-dot" />
-            {status === 'ready' ? 'SESSION ACTIVE' : status === 'loading' ? 'INITIALISATION…' : 'SESSION HORS LIGNE'}
-          </div>
-          <span className="topbar-separator" />
-          <span className="project-name">Untitled project <ChevronDown size={13} /></span>
+    <main
+      ref={stageRef}
+      className="camera-stage"
+      onPointerMove={wakeControls}
+      onPointerDown={wakeControls}
+    >
+      {/* Fullscreen mirrored live webcam */}
+      <video ref={videoRef} className="camera-video" playsInline muted autoPlay />
+
+      {/* Fullscreen photorealistic 3D Iron Man Mark 85 nanotech overlay */}
+      <canvas ref={canvasRef} className="armor-canvas" />
+
+      {/* Subtle status pill while camera is live */}
+      {status === 'ready' && (!trackerReady || statusBanner || !telemetry.bodyDetected) && (
+        <div className="top-hint" role="status" aria-live="polite">
+          <span className={`hint-dot ${statusBanner ? 'is-err' : !trackerReady ? 'is-wait' : 'is-scan'}`} />
+          <span>
+            {statusBanner
+              ? statusBanner
+              : !trackerReady
+                ? 'Chargement de la détection corporelle…'
+                : 'Placez-vous face à la caméra pour équiper l’armure'}
+          </span>
         </div>
-        <div className="topbar-actions">
-          <button className="icon-button help-button" aria-label="Aide" title="Aide"><CircleHelp size={17} /></button>
-          <button className="export-button" onClick={captureFrame} disabled={status !== 'ready'}>
-            <Download size={15} /> <span>Exporter</span>
-          </button>
-          <div className="avatar">A</div>
-        </div>
-      </header>
+      )}
 
-      <div className="workspace">
-        <nav className="tool-rail" aria-label="Outils">
-          <button className="rail-button active" aria-label="Studio" title="Studio"><Aperture size={18} /></button>
-          <button className="rail-button" aria-label="Caméra" title="Caméra"><Video size={18} /></button>
-          <button className="rail-button" aria-label="Couches" title="Couches"><Layers3 size={18} /></button>
-          <div className="rail-spacer" />
-          <button className="rail-button" aria-label="Paramètres" title="Paramètres"><Settings2 size={18} /></button>
-          <div className="rail-version">V 1.0</div>
-        </nav>
-
-        <section className="editor">
-          <div className="editor-heading">
-            <div>
-              <div className="eyebrow"><span className="eyebrow-line" /> REAL-TIME COMPOSITING</div>
-              <h1>Armor <span>studio</span></h1>
-              <p className="page-description">Votre scène. Votre armure. En temps réel.</p>
-            </div>
-            <div className="heading-tools">
-              <div className="scene-chip"><span className="scene-chip-dot" /> SCÈNE 01</div>
-              <span className="tool-separator" />
-              <button className="icon-button" aria-label="Réinitialiser les effets" onClick={() => setOptions(INITIAL_OPTIONS)} title="Réinitialiser">
-                <RotateCcw size={16} />
-              </button>
-              <button className="icon-button" aria-label="Plein écran" onClick={toggleFullscreen} title="Plein écran">
-                <Maximize2 size={16} />
-              </button>
-            </div>
+      {/* Initial camera activation screen (with automatic action buttons if browser pauses prompt) */}
+      {status === 'starting' && (
+        <div className="center-overlay">
+          <div className="camera-prompt">
+            <div className="spinner-ring" aria-hidden="true" />
+            <h1 className="prompt-title">Iron Man Mark 85 — Activation Webcam</h1>
+            <p className="prompt-text">
+              Cliquez sur <strong>Autoriser</strong> dans la fenêtre de votre navigateur pour démarrer la caméra en plein écran.
+            </p>
+            {showStartActions && (
+              <div className="prompt-actions">
+                <button type="button" className="primary-action" onClick={() => void startCamera()}>
+                  <Camera size={17} />
+                  <span>Activer ma webcam</span>
+                </button>
+                {inIframe && pageUrl && (
+                  <a
+                    className="secondary-action"
+                    href={pageUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <ExternalLink size={15} />
+                    <span>Ouvrir dans un nouvel onglet</span>
+                  </a>
+                )}
+              </div>
+            )}
           </div>
+        </div>
+      )}
 
-          <div className="camera-stage">
-            <div className="camera-feed">
-              <video ref={videoRef} autoPlay muted playsInline aria-label="Flux de la webcam" />
-              <div ref={overlayHostRef} className="three-host" />
-              <canvas ref={trackingCanvasRef} className="tracking-canvas" />
+      {/* Webcam permission / embedded-iframe unlock screen */}
+      {status === 'error' && (
+        <div className="center-overlay">
+          <div className="camera-prompt">
+            <div className="prompt-icon" aria-hidden="true">
+              <Camera size={26} />
             </div>
+            <h1 className="prompt-title">
+              {errorKind === 'iframe-blocked'
+                ? 'Activer votre Webcam PC'
+                : errorKind === 'not-found'
+                  ? 'Webcam introuvable'
+                  : errorKind === 'in-use'
+                    ? 'Webcam déjà utilisée'
+                    : 'Autoriser votre Webcam'}
+            </h1>
+            <p className="prompt-text">{errorMessage}</p>
 
-            {status !== 'ready' && (
-              <div className={`camera-welcome ${status === 'error' ? 'has-error' : ''}`}>
-                <div className="welcome-orbit orbit-one" />
-                <div className="welcome-orbit orbit-two" />
-                <div className="welcome-symbol"><Shield size={29} strokeWidth={1.25} /></div>
-                <div className="welcome-kicker">{status === 'loading' ? 'CHARGEMENT DES MODÈLES' : 'STUDIO DE RÉALITÉ AUGMENTÉE'}</div>
-                <h2>{status === 'loading' ? 'Préparation de votre scène' : 'Prêt à passer en armure ?'}</h2>
-                <p>
-                  {status === 'loading'
-                    ? 'La caméra et les modèles de détection se préparent dans votre navigateur.'
-                    : 'Activez votre caméra pour suivre votre visage, votre corps et vos mains.'}
-                </p>
-                {error && <div className="error-banner"><X size={14} /> {error}</div>}
-                {status !== 'loading' && (
-                  <button className="start-button" onClick={startCamera}>
-                    <Camera size={16} /> Activer la caméra <span className="button-arrow">↗</span>
+            <div className="prompt-actions">
+              {errorKind === 'iframe-blocked' && pageUrl ? (
+                <>
+                  <a
+                    className="primary-action"
+                    href={pageUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <ExternalLink size={17} />
+                    <span>Ouvrir en plein onglet (activer la caméra)</span>
+                  </a>
+                  <div className="action-row">
+                    <button type="button" className="secondary-action" onClick={handleCopyUrl}>
+                      {copied ? <Check size={15} /> : <Copy size={15} />}
+                      <span>{copied ? 'Lien copié !' : 'Copier le lien'}</span>
+                    </button>
+                    <button type="button" className="secondary-action" onClick={() => void startCamera()}>
+                      <RefreshCw size={15} />
+                      <span>Réessayer</span>
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <button type="button" className="primary-action" onClick={() => void startCamera()}>
+                    <Camera size={17} />
+                    <span>Activer ma webcam</span>
                   </button>
-                )}
-                <div className="welcome-privacy"><div className="privacy-lock">⌑</div> TRAITEMENT LOCAL · AUCUNE VIDÉO ENVOYÉE</div>
-              </div>
-            )}
-
-            {status === 'ready' && (
-              <>
-                <div className="stage-topline">
-                  <div className="live-tag"><span className="status-dot" /> LIVE</div>
-                  <div className="tracking-tag"><span className={`tracking-dot ${trackingReady ? 'found' : ''}`} /> {trackingReady ? 'SUJET DÉTECTÉ' : 'RECHERCHE DU SUJET'}</div>
-                </div>
-                <div className={`repulsor-hint ${repulsorReady ? 'armed' : ''}`}>
-                  <Zap size={12} /> {repulsorReady ? 'RÉPULSEUR · TIR' : 'OUVREZ LA MAIN POUR TIRER'}
-                </div>
-                <div className="stage-corner top-left" />
-                <div className="stage-corner top-right" />
-                <div className="stage-corner bottom-left" />
-                <div className="stage-corner bottom-right" />
-                {!trackingReady && (
-                  <div className="searching-note"><ScanFace size={15} /> Placez-vous face à la caméra</div>
-                )}
-                <div className="stage-bottomline">
-                  <span title="FPS de rendu WebGL et cadence réelle de l’inférence MediaPipe dans le Worker">
-                    <span className="fps-dot" /> WEBGL {renderFps || '—'} · IA {frame.fps || '—'} FPS
-                  </span>
-                  <span>{cameraSize.width || '—'} × {cameraSize.height || '—'} <i /> FRONT CAMERA</span>
-                </div>
-              </>
-            )}
-
-            {rendererError && <div className="error-banner renderer-error">{rendererError}</div>}
-
-            <div className="stage-controls">
-              {status === 'ready' ? (
-                <button className="stage-control" onClick={() => setPaused((value) => !value)} aria-label={paused ? 'Reprendre' : 'Mettre en pause'}>
-                  {paused ? <Play size={15} /> : <Pause size={15} />}
-                </button>
-              ) : null}
-              <button className="stage-control" onClick={toggleFullscreen} aria-label="Plein écran"><Expand size={15} /></button>
+                  {pageUrl && errorKind === 'permission-denied' && (
+                    <a
+                      className="secondary-action"
+                      href={pageUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <ExternalLink size={15} />
+                      <span>Ouvrir dans un nouvel onglet</span>
+                    </a>
+                  )}
+                </>
+              )}
             </div>
           </div>
+        </div>
+      )}
 
-          <div className="metrics-row">
-            <div className="metric-card">
-              <div className="metric-icon"><Gauge size={16} /></div>
-              <div className="metric-copy"><span>WEBGL RENDER</span><strong>{renderFps || '—'} <small>FPS</small></strong></div>
-              <div className="metric-graph"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
-            </div>
-            <div className="metric-card">
-              <div className="metric-icon cyan"><Activity size={16} /></div>
-              <div className="metric-copy"><span>TRACKING</span><strong>{trackingReady ? 'Actif' : status === 'ready' ? 'Recherche' : 'En attente'}</strong></div>
-              <div className={`metric-live ${trackingReady ? 'on' : ''}`}><span /> {trackingReady ? 'LIVE' : '—'}</div>
-            </div>
-            <div className="metric-card detection-metric">
-              <div className="metric-icon gold"><ScanFace size={16} /></div>
-              <div className="metric-copy"><span>DÉTECTIONS</span><strong>{frame.face.length > 0 || frame.pose.length > 0 ? '01' : '00'} <small>SUJET</small></strong></div>
-              <div className="detection-stack"><span /><span /><span /></div>
-            </div>
-          </div>
+      {/* Discreet auto-fading floating triggers over the live fullscreen webcam */}
+      {status === 'ready' && trackerReady && (
+        <div className={`floating-dock ${controlsAwake ? 'is-awake' : 'is-idle'}`}>
+          <button
+            type="button"
+            className="dock-btn dock-btn-primary"
+            onClick={handleReplay}
+            title="Rejouer la génération nanotech (Espace / R)"
+          >
+            <RotateCcw size={15} />
+            <span>Nanotech</span>
+          </button>
 
-          <div className="detection-list">
-            <div className="section-label"><span>TRACKING EN DIRECT</span><span className="landmark-label">LANDMARKS</span></div>
-            {detections.map(({ label, count, active, icon: Icon }) => (
-              <div className="detection-row" key={label}>
-                <div className={`detection-icon ${active ? 'detected' : ''}`}><Icon size={15} /></div>
-                <span className="detection-name">{label}</span>
-                <span className={`detection-state ${active ? 'detected' : ''}`}>{active ? 'DÉTECTÉ' : 'EN ATTENTE'}</span>
-                <span className="detection-count">{count}</span>
-                <div className={`detection-check ${active ? 'checked' : ''}`}>{active && <Check size={11} />}</div>
-              </div>
-            ))}
-          </div>
-        </section>
+          <button
+            type="button"
+            className="dock-btn"
+            onClick={handleToggleSuit}
+            title="Rétracter ou équiper l’armure (E ou touchez votre torse)"
+          >
+            {suitActive ? <ShieldOff size={15} /> : <Shield size={15} />}
+            <span>{suitActive ? 'Rétracter' : 'Équiper'}</span>
+          </button>
 
-        <aside className="inspector">
-          <div className="inspector-header">
-            <div><span className="inspector-kicker">CONFIGURATION</span><h2>Propriétés</h2></div>
-            <button className="icon-button" aria-label="Paramètres de propriété"><Settings2 size={16} /></button>
-          </div>
+          <button
+            type="button"
+            className="dock-btn"
+            onClick={handleToggleVisor}
+            title="Ouvrir ou fermer le masque (V)"
+          >
+            {telemetry.visorOpen ? <Eye size={15} /> : <EyeOff size={15} />}
+            <span>{telemetry.visorOpen ? 'Fermer masque' : 'Ouvrir masque'}</span>
+          </button>
 
-          <section className="inspector-section">
-            <div className="section-heading"><span>ARMURE</span><span className="section-count">01 / 04</span></div>
-            <div className="armor-card">
-              <div className="armor-preview">
-                <div className="armor-preview-glow" />
-                <div className="armor-hex"><Shield size={29} strokeWidth={1.1} /></div>
-                <div className="armor-preview-line line-a" />
-                <div className="armor-preview-line line-b" />
-                <div className="armor-preview-tag">NOVA · 01</div>
-                <div className="armor-preview-scan" />
-              </div>
-              <div className="armor-details">
-                <div><span className="armor-name">NOVA-01</span><span className="armor-edition">EXO FRAME · V1</span></div>
-                <button className="select-button" title="Armure sélectionnée"><Check size={13} /></button>
-              </div>
-            </div>
-            <button className="browse-button"><span><Sparkles size={14} /> Explorer les armures</span><span>↗</span></button>
-          </section>
-
-          <section className="inspector-section layers-section">
-            <div className="section-heading"><span>CALQUES VFX</span><button className="text-icon-button" aria-label="Ajouter un calque">+</button></div>
-            {[
-              { key: 'armor', label: 'Plaques d’armure', detail: 'Rendu 3D · suivi du corps', icon: Shield },
-              { key: 'face', label: 'Visière & visage', detail: '478 points · maillage facial', icon: ScanFace },
-              { key: 'hands', label: 'Répulseurs', detail: 'Suivi des mains · x2', icon: Hand },
-              { key: 'effects', label: 'Effets lumineux', detail: 'Réacteur · halos · bloom', icon: Zap },
-            ].map(({ key, label, detail, icon: Icon }) => {
-              const isEnabled = options[key as keyof Omit<OverlayOptions, 'intensity'>];
-              return (
-                <button
-                  className={`layer-row ${isEnabled ? '' : 'muted'}`}
-                  key={key}
-                  onClick={() => toggleOption(key as keyof Omit<OverlayOptions, 'intensity'>)}
-                >
-                  <span className="layer-icon"><Icon size={14} /></span>
-                  <span className="layer-copy"><strong>{label}</strong><small>{detail}</small></span>
-                  <span className={`switch ${isEnabled ? 'on' : ''}`}><i /></span>
-                </button>
-              );
-            })}
+          {cameras.length > 1 && (
             <button
-              className={`layer-row tracking-layer ${options.body ? '' : 'muted'}`}
-              onClick={() => toggleOption('body')}
+              type="button"
+              className="dock-icon"
+              onClick={cycleCamera}
+              title="Changer de webcam"
+              aria-label="Changer de webcam"
             >
-              <span className="layer-icon"><Eye size={14} /></span>
-              <span className="layer-copy"><strong>Points de tracking</strong><small>Squelette & contours</small></span>
-              <span className={`switch ${options.body ? 'on' : ''}`}><i /></span>
+              <SwitchCamera size={16} />
             </button>
-          </section>
+          )}
 
-          <section className="inspector-section intensity-section">
-            <div className="section-heading"><span>INTENSITÉ DES EFFETS</span><span className="intensity-value">{Math.round(options.intensity * 100)}%</span></div>
-            <input
-              aria-label="Intensité des effets"
-              type="range"
-              min="0.4"
-              max="1.6"
-              step="0.05"
-              value={options.intensity}
-              onChange={(event) => setOptions((current) => ({ ...current, intensity: Number(event.target.value) }))}
-            />
-            <div className="range-labels"><span>SUBTIL</span><span>INTENSE</span></div>
-          </section>
+          <button
+            type="button"
+            className={`dock-icon ${soundOn ? 'is-on' : ''}`}
+            onClick={handleToggleSound}
+            title={soundOn ? 'Couper le son (M)' : 'Activer le son (M)'}
+            aria-label={soundOn ? 'Couper le son' : 'Activer le son'}
+          >
+            {soundOn ? <Volume2 size={16} /> : <VolumeX size={16} />}
+          </button>
 
-          <div className="inspector-footer">
-            <div className="engine-status"><span className="engine-dot" /><span>MOTEUR DE TRACKING</span><strong>{status === 'ready' ? (cpuMode ? 'CPU' : 'GPU') : 'PRÊT'}</strong></div>
-            <button className="stop-camera-button" onClick={status === 'ready' ? stopCamera : startCamera} disabled={status === 'loading'}>
-              {status === 'ready' ? <><X size={13} /> Arrêter la caméra</> : <><Camera size={13} /> {status === 'loading' ? 'Chargement…' : 'Démarrer la caméra'}</>}
-            </button>
-          </div>
-        </aside>
-      </div>
-      <footer className="app-footer">
-        <span><span className="footer-online" /> SYSTÈME OPÉRATIONNEL</span>
-        <span>MediaPipe Vision <i /> Three.js <i /> 100% LOCAL</span>
-        <span>ARMOR LAB <b>·</b> 2026</span>
-      </footer>
+          <button
+            type="button"
+            className="dock-icon"
+            onClick={handleFullscreen}
+            title={isFullscreen ? 'Quitter le plein écran (F)' : 'Plein écran (F)'}
+            aria-label={isFullscreen ? 'Quitter le plein écran' : 'Plein écran'}
+          >
+            {isFullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+          </button>
+        </div>
+      )}
     </main>
   );
 }
-
-export default App;
